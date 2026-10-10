@@ -1,4 +1,7 @@
 use super::*;
+#[path = "dpi_presets.rs"]
+mod presets;
+pub use presets::action as dpi_presets;
 
 const DPI: &str = "razer.device.dpi";
 const MISC: &str = "razer.device.misc";
@@ -98,6 +101,34 @@ fn validate_dpi(device: &DeviceSnapshot, x: &Json, y: &Json) -> Result<Vec<Json>
     Ok(vec![json!(x), json!(y)])
 }
 
+fn poll_rates(device: &DeviceSnapshot) -> Option<Vec<u64>> {
+    method(device, MISC, "getPollRate", "")?;
+    method(device, MISC, "setPollRate", "q")?;
+    device.value(MISC, "getPollRate")?.as_u64()?;
+    let rates = if device
+        .methods
+        .iter()
+        .any(|method| method.interface == MISC && method.name == "getSupportedPollRates")
+    {
+        device
+            .value(MISC, "getSupportedPollRates")?
+            .as_array()?
+            .iter()
+            .map(Json::as_u64)
+            .collect::<Option<Vec<_>>>()?
+    } else if matches!(device.product_id(), Some(0x0086 | 0x0088)) {
+        // OpenRazer device_base supplies these POLL_RATES for Basilisk classes
+        // with set_poll_rate but no explicit table or rates D-Bus getter.
+        vec![125, 500, 1000]
+    } else {
+        return None;
+    };
+    if rates.is_empty() || rates.iter().any(|rate| !(1..=65535).contains(rate)) {
+        return None;
+    }
+    Some(rates)
+}
+
 pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static str, Group)> {
     let mut groups = Vec::new();
     let mut sensitivity = Group::new(
@@ -105,20 +136,55 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         format!("{component} sensitivity"),
         "Device DPI and daemon-configured polling; Apply is explicit",
     );
-    if let (Some(current), Some(max)) = (
-        device
-            .value(DPI, "getDPI")
-            .and_then(Json::as_array)
-            .filter(|pair| pair.len() == 2),
-        max_dpi(device),
-    ) && method(device, DPI, "setDPI", "qq").is_some()
+    let has_device_stages = method(device, DPI, "getDPIStages", "").is_some()
+        && method(device, DPI, "setDPIStages", "ya(qq)").is_some();
+    let available = device
+        .value(DPI, "availableDPI")
+        .and_then(Json::as_array)
+        .filter(|values| !values.is_empty());
+    let host_presets = matches!(device.product_id(), Some(0x0086 | 0x0088))
+        && available.is_none()
+        && !has_device_stages
+        && method(device, DPI, "getDPI", "").is_some()
+        && method(device, DPI, "setDPI", "qq").is_some()
+        && max_dpi(device).is_some();
+    let mut host_control = false;
+    if host_presets {
+        match presets::control(device) {
+            Ok(control) => {
+                let subtitle = if control["x"].is_null() {
+                    "Current DPI unavailable · editable host presets are not hardware readback"
+                        .into()
+                } else {
+                    format!(
+                        "Current {} × {} DPI · maximum {}",
+                        control["x"], control["y"], control["max"]
+                    )
+                };
+                sensitivity
+                    .rows
+                    .push(Row::info("dpi", "Sensitivity", subtitle).controlled(control));
+                host_control = true;
+            }
+            Err(error) => sensitivity.rows.push(Row::info(
+                "host-presets-error",
+                "Host DPI presets unavailable",
+                format!("{error:#}. Existing config is preserved."),
+            )),
+        }
+    }
+    if !host_control
+        && let (Some(current), Some(max)) = (
+            device
+                .value(DPI, "getDPI")
+                .and_then(Json::as_array)
+                .filter(|pair| pair.len() == 2),
+            max_dpi(device),
+        )
+        && method(device, DPI, "setDPI", "qq").is_some()
         && validate_dpi(device, &current[0], &current[1]).is_ok()
     {
-        let fields = if let Some(available) = device
-            .value(DPI, "availableDPI")
-            .and_then(Json::as_array)
-            .filter(|values| !values.is_empty())
-        {
+        let fields = if let Some(available) = available {
             vec![choice_field(
                 "x",
                 "DPI",
@@ -147,26 +213,19 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
             .controlled(form(device, "dpi", DPI, fields)),
         );
     }
-    if let (Some(current), Some(supported)) = (
-        device.value(MISC, "getPollRate"),
-        device
-            .value(MISC, "getSupportedPollRates")
-            .and_then(Json::as_array),
-    ) && method(device, MISC, "setPollRate", "q").is_some()
+    if let (Some(current), Some(supported)) =
+        (device.value(MISC, "getPollRate"), poll_rates(device))
     {
         let options: Vec<Json> = supported
             .iter()
-            .filter_map(Json::as_u64)
-            .filter(|rate| (1..=65535).contains(rate))
             .map(|rate| json!({"value":rate.to_string(),"label":format!("{rate} Hz")}))
             .collect();
         let current_rate = current.to_string();
-        if !options.is_empty()
-            && options
-                .iter()
-                .any(|option| option["value"].as_str() == Some(current_rate.as_str()))
+        if options
+            .iter()
+            .any(|option| option["value"].as_str() == Some(current_rate.as_str()))
         {
-            sensitivity.rows.push(Row::info("polling", "Configured polling", "Only rates advertised by this daemon device; not a controller polling override.").controlled(json!({"kind":"choice","value":current.to_string(),"options":options,"action":"openrazer-configure","args":{"device":device.serial,"operation":"polling"}})));
+            sensitivity.rows.push(Row::info("polling", "Configured polling", "Device-advertised rates, or verified OpenRazer Basilisk defaults; not a controller override.").controlled(json!({"kind":"choice","value":current.to_string(),"options":options,"action":"openrazer-configure","args":{"device":device.serial,"operation":"polling"}})));
         }
     }
     if let (Some(stages), Some(max)) = (
@@ -221,7 +280,7 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
             );
         }
     } else if matches!(device.product_id(), Some(0x0086 | 0x0088)) {
-        sensitivity.rows.push(Row::info("stages", "DPI stage table unavailable", "OpenRazer's Basilisk Ultimate class exports current DPI, not getDPIStages/setDPIStages. No fake stage table or onboard profile write is offered."));
+        sensitivity.rows.push(Row::info("host-presets", "Host presets, not onboard stages", "Save stores editable presets on this computer only. Apply, activate and next/previous explicitly call setDPI. The physical DPI-cycle button does not use host presets; refresh only reads the current daemon DPI."));
     }
     if !sensitivity.rows.is_empty() {
         groups.push(("sensitivity", sensitivity));
@@ -528,12 +587,9 @@ fn arguments(device: &DeviceSnapshot, args: &Json) -> Result<(String, String, Ve
                 .as_str()
                 .context("Poll rate must be a choice string")?
                 .parse::<u64>()?;
-            let rates = device
-                .value(MISC, "getSupportedPollRates")
-                .and_then(Json::as_array)
-                .context("Supported poll rates unavailable")?;
-            if !rates.iter().any(|value| value.as_u64() == Some(rate)) {
-                bail!("Poll rate is not advertised by this device");
+            let rates = poll_rates(device).context("Supported poll rates unavailable")?;
+            if !rates.contains(&rate) {
+                bail!("Poll rate is not supported by this device");
             }
             Ok((MISC.into(), "setPollRate".into(), vec![json!(rate)]))
         }
@@ -740,5 +796,90 @@ mod tests {
             )
             .is_err()
         );
+    }
+    fn polling_device(pid: u16) -> DeviceSnapshot {
+        DeviceSnapshot {
+            serial: "stable-serial".into(),
+            methods: parse_methods("<node><interface name='razer.device.misc'><method name='getPollRate'><arg type='i' direction='out'/></method><method name='setPollRate'><arg type='q' direction='in'/></method></interface></node>").unwrap(),
+            values: BTreeMap::from([
+                ("razer.device.misc.getVidPid".into(), Ok(json!([0x1532,pid]))),
+                ("razer.device.misc.getPollRate".into(), Ok(json!(500))),
+            ]), diagnostics: Group::new("api", "API", ""),
+        }
+    }
+    #[test]
+    fn basilisk_polling_defaults_are_model_and_capability_specific() {
+        for pid in [0x0086, 0x0088] {
+            let device = polling_device(pid);
+            assert_eq!(poll_rates(&device), Some(vec![125, 500, 1000]));
+            assert_eq!(
+                arguments(&device, &json!({"operation":"polling","value":"125"}))
+                    .unwrap()
+                    .2,
+                vec![json!(125)]
+            );
+            assert!(arguments(&device, &json!({"operation":"polling","value":"2000"})).is_err());
+            let groups = product_groups(&device, "Mouse");
+            let control = groups[0]
+                .1
+                .rows
+                .iter()
+                .find(|row| row.id == "polling")
+                .unwrap()
+                .control
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                control["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|option| option["value"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["125", "500", "1000"]
+            );
+        }
+        for pid in [0x007e, 0x0a3f, 0xffff] {
+            assert!(poll_rates(&polling_device(pid)).is_none());
+        }
+        let mut device = polling_device(0x0088);
+        device.methods.retain(|method| method.name != "getPollRate");
+        assert!(poll_rates(&device).is_none());
+        device = polling_device(0x0088);
+        device.methods.retain(|method| method.name != "setPollRate");
+        assert!(poll_rates(&device).is_none());
+        device = polling_device(0x0088);
+        device.values.insert(
+            "razer.device.misc.getVidPid".into(),
+            Ok(json!([0x0000, 0x0088])),
+        );
+        assert!(poll_rates(&device).is_none());
+    }
+    #[test]
+    fn advertised_poll_rates_take_precedence_even_when_unavailable() {
+        let mut device = polling_device(0x0088);
+        device.methods.extend(parse_methods("<node><interface name='razer.device.misc'><method name='getSupportedPollRates'><arg type='ai' direction='out'/></method></interface></node>").unwrap());
+        device.values.insert(
+            "razer.device.misc.getSupportedPollRates".into(),
+            Ok(json!([500, 2000])),
+        );
+        assert_eq!(poll_rates(&device), Some(vec![500, 2000]));
+        assert!(arguments(&device, &json!({"operation":"polling","value":"125"})).is_err());
+        assert_eq!(
+            arguments(&device, &json!({"operation":"polling","value":"2000"}))
+                .unwrap()
+                .2,
+            vec![json!(2000)]
+        );
+        for value in [
+            Ok(json!([])),
+            Ok(json!([500, 65536])),
+            Err("getter unavailable".into()),
+        ] {
+            device
+                .values
+                .insert("razer.device.misc.getSupportedPollRates".into(), value);
+            assert!(poll_rates(&device).is_none());
+        }
     }
 }

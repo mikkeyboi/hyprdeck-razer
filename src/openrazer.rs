@@ -2,7 +2,7 @@ use crate::{Group, Row, string_arg};
 #[path = "openrazer_controls.rs"]
 mod controls;
 use anyhow::{Context, Result, bail};
-pub use controls::{configure, product_groups};
+pub use controls::{configure, dpi_presets, product_groups};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

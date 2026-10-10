@@ -95,8 +95,8 @@ impl Device {
         };
         let mut group = Group::new(
             format!("controller:{}", self.id),
-            name,
-            "Live standard inputs · select a button or stick to inspect",
+            "Live controller input",
+            "Select a button or stick to inspect its standard output",
         );
         if self.product_id == 0x0a3f || inputs.is_some() {
             group.visualization = Some(Visualization::Controller {
@@ -106,11 +106,10 @@ impl Device {
                 inputs: inputs.unwrap_or_else(crate::input::unknown_controller_inputs),
             });
         }
-        group.rows.push(Row::info("connection", connection, status));
-        group.rows.push(Row::info("polling", "Polling & live view", if self.product_id == 0x0a3f {
-            "Up to 250 Hz wireless · 1000 Hz wired PC Tournament Mode (Function + Menu + A). UI sampling is separate; no interval override."
+        group.rows.push(Row::info("polling", "Physical polling", if self.product_id == 0x0a3f {
+            "Up to 250 Hz wireless · 1000 Hz wired PC Tournament Mode (Function + Menu + A). The live view samples every 500 ms."
         } else {
-            "500 ms view sampling; physical polling limits are not inferred from this USB identity. Measurement and USB scheduling details are separate."
+            "Physical polling limits are not inferred from USB identity. The live view samples every 500 ms; measure changed-input cadence below."
         }));
         if self.product_id == 0x0a3f {
             group.rows.push(Row::info("firmware-check", "Firmware · official Windows updater", "Installed firmware is unreadable here. Check the offered updater; no comparison or Linux flash.").controlled(json!({"kind":"button","label":"Check vendor updater","action":"firmware-check","args":{"device":self.id},"destructive":false})));
@@ -118,6 +117,7 @@ impl Device {
         } else {
             group.rows.push(Row::info("firmware", "Firmware · vendor model required", "Installed proprietary firmware is not readable via xpad/evdev. The verified original 0a3f updater is not offered for this different USB identity."));
         }
+        group.rows.push(Row::info("capabilities", "Available here", "Live standard inputs and explicit cadence measurement. See Lighting, Buttons & macros and Headset audio for configuration boundaries; raw records stay in Diagnostics."));
         group
     }
 

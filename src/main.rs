@@ -218,6 +218,7 @@ async fn dispatch(request: Request) -> Result<State> {
                 }
                 "openrazer-call" => Some(openrazer::action(&request.args).await?),
                 "openrazer-configure" => Some(openrazer::configure(&request.args).await?),
+                "dpi-presets" => Some(openrazer::dpi_presets(&request.args).await?),
                 "input-remapper" => {
                     remapper::action(&request.args).await?;
                     None

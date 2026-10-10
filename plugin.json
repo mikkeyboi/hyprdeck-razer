@@ -3,7 +3,7 @@
   "id": "razer",
   "name": "Razer peripherals",
   "description": "Cohesive mouse/controller products, genuine OpenRazer controls and secondary diagnostics",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "executable": "hyprdeck-razer",
   "update_repo": "mikkeyboi/hyprdeck-razer",
   "asset": "hyprdeck-razer-linux-x86_64"

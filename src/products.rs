@@ -200,15 +200,53 @@ pub fn assemble(
         };
         let mut summary = Group::new(
             format!("{id}:overview"),
-            name,
-            "Physical product and its connected components",
+            if controller {
+                "Current connection"
+            } else {
+                name
+            },
+            if controller {
+                "Observed kernel driver and USB scheduling"
+            } else {
+                "Physical product and its connected components"
+            },
         );
         let mut diagnostics = Vec::new();
         let mut settings: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         let mut battery = None;
         for device in &components {
-            summary.rows.push(Row::info(format!("component-{}", device.port), component_name(device), if device.product_id == 0x007e { "Charging dock connected · charging status comes from the mouse, not dock USB presence" } else if controller { "Receiver/USB present · kernel input does not independently prove a radio link" } else { "Connected component · actual configuration capabilities queried separately" }));
+            if !controller {
+                summary.rows.push(Row::info(format!("component-{}", device.port), component_name(device), if device.product_id == 0x007e { "Charging dock connected · charging status comes from the mouse, not dock USB presence" } else { "Connected component · actual configuration capabilities queried separately" }));
+            }
             let detail = device.group();
+            if controller {
+                if let Some(driver) = detail.rows.iter().find(|row| row.id == "drivers") {
+                    summary.rows.push(Row::info(
+                        "driver",
+                        "Current kernel driver",
+                        &driver.subtitle,
+                    ));
+                }
+                let schedules: BTreeSet<&str> = detail
+                    .rows
+                    .iter()
+                    .filter(|row| row.id.contains("-ep-"))
+                    .filter_map(|row| row.subtitle.split(';').next())
+                    .collect();
+                summary.rows.push(Row::info(
+                    "usb-schedule",
+                    "USB interrupt scheduling",
+                    if schedules.is_empty() {
+                        "No readable interrupt-IN schedule · not a physical polling measurement"
+                            .into()
+                    } else {
+                        format!(
+                            "{} · scheduling opportunities, not measured reports",
+                            schedules.into_iter().collect::<Vec<_>>().join("; ")
+                        )
+                    },
+                ));
+            }
             diagnostics.push(detail.id.clone());
             groups.push(detail);
             let mut summaries = Vec::new();
@@ -339,8 +377,12 @@ pub fn assemble(
         }
         let summary_id = summary.id.clone();
         groups.push(summary);
-        let mut overview = vec![summary_id];
-        overview.extend(settings.remove("overview").unwrap_or_default());
+        let mut overview = settings.remove("overview").unwrap_or_default();
+        if controller {
+            overview.push(summary_id);
+        } else {
+            overview.insert(0, summary_id);
+        }
         let mut sections = vec![section("overview", "Overview", overview)];
         for (section_id, title) in [
             ("sensitivity", "Sensitivity"),
@@ -370,7 +412,7 @@ pub fn assemble(
             description: if mouse {
                 "Mouse, wireless receiver and connected charging dock"
             } else if controller {
-                "Native controller input · device configuration capability status"
+                "Live inputs, connection status and firmware tools"
             } else {
                 "Physical USB product · verified API capabilities only"
             }
