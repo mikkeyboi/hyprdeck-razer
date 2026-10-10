@@ -2,6 +2,8 @@ mod cache;
 mod firmware;
 mod input;
 mod openrazer;
+mod products;
+mod remapper;
 mod usb;
 
 use anyhow::{Context, Result, bail};
@@ -28,7 +30,34 @@ pub struct State {
     title: String,
     description: String,
     groups: Vec<Group>,
+    products: Vec<Product>,
     refresh_interval_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Product {
+    id: String,
+    name: String,
+    kind: String,
+    description: String,
+    status: String,
+    connection: String,
+    battery: Option<Battery>,
+    sections: Vec<ProductSection>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Battery {
+    percentage: Option<f64>,
+    charging: Option<bool>,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductSection {
+    id: String,
+    title: String,
+    groups: Vec<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Group {
@@ -123,66 +152,25 @@ pub fn string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 async fn state() -> Result<State> {
     let devices = usb::devices()?;
     let controller_present = devices.iter().any(usb::Device::is_controller);
-    let mut groups = Vec::new();
-    let mut details = Vec::new();
-    for device in &devices {
-        details.push(device.group());
-        let mut summaries = Vec::new();
-        if let Some((result, summary)) = cache::load("firmware", &device.id) {
-            summaries.extend(summary);
-            details.push(result.collapsed());
-        }
-        let mut live_inputs = None;
-        let mut measurement = None;
-        let mut input_error = false;
-        for node in input::nodes(device)? {
-            let sample =
-                input::snapshot(&node, device.is_controller(), device.product_id == 0x0a3f);
-            let selected = live_inputs.is_none() && sample.inputs.is_some();
-            if selected {
-                live_inputs = sample.inputs;
-                measurement = Some(input::measurement_row(&node));
-            }
-            input_error |= sample.error.is_some();
-            details.push(sample.group);
-            if let Some((result, summary)) = cache::load("measurement", &node.id) {
-                if selected {
-                    summaries.extend(summary);
-                }
-                details.push(result.collapsed());
+    let (daemon, firmware) = tokio::join!(openrazer::state(), firmware::state());
+    let (mut groups, mut products) = products::assemble(&devices, daemon)?;
+    for group in firmware {
+        for product in &mut products {
+            if let Some(section) = product
+                .sections
+                .iter_mut()
+                .find(|section| section.id == "diagnostics")
+            {
+                section.groups.push(group.id.clone());
             }
         }
-        if device.is_controller() {
-            let status = if live_inputs.is_some() && device.product_id == 0x0a57 {
-                "Kernel input available · 500 ms sampled"
-            } else if live_inputs.is_some() {
-                "Kernel input available · 500 ms sampled · radio status unavailable"
-            } else if input_error {
-                "Input unavailable · inspect permissions/removal in input details"
-            } else {
-                "USB present · no readable controller input node"
-            };
-            let mut group = device.controller_group(live_inputs, status);
-            if let Some(row) = measurement {
-                group.rows.push(row);
-            }
-            group.rows.extend(summaries);
-            groups.push(group);
-        }
+        groups.push(group.collapsed());
     }
-    if devices.is_empty() {
-        let mut group = Group::new("usb", "USB devices", "Read-only Linux sysfs discovery");
-        group.rows.push(Row::info("none", "No connected Razer USB device", "No device with USB vendor 1532 is currently enumerated. Reconnect and refresh; no stale device records are retained."));
-        groups.push(group);
-    }
-    groups.extend(details);
-    let (openrazer, firmware) = tokio::join!(openrazer::state(), firmware::state());
-    groups.extend(openrazer.into_iter().map(Group::collapsed));
-    groups.extend(firmware.into_iter().map(Group::collapsed));
     Ok(State {
         title: "Razer peripherals".into(),
-        description: "Live controllers and genuine peripheral capabilities. Select inputs to inspect; expand expert details for USB, evdev, OpenRazer and firmware diagnostics. Native controller settings stay unchanged.".into(),
+        description: "Select a product for its controls, components and capability status. Raw USB/input/API records remain in Diagnostics; refresh never changes hardware settings.".into(),
         groups,
+        products,
         refresh_interval_ms: if controller_present { 500 } else { 2000 },
     })
 }
@@ -229,6 +217,19 @@ async fn dispatch(request: Request) -> Result<State> {
                     )
                 }
                 "openrazer-call" => Some(openrazer::action(&request.args).await?),
+                "openrazer-configure" => Some(openrazer::configure(&request.args).await?),
+                "input-remapper" => {
+                    remapper::action(&request.args).await?;
+                    None
+                }
+                "openrazer-setup" => {
+                    openrazer::setup().await?;
+                    None
+                }
+                "controller-support" => {
+                    products::controller_support(&request.args).await?;
+                    None
+                }
                 "firmware-check" => Some(firmware::vendor_check(&request.args).await?),
                 "vendor-page" => {
                     firmware::open_page(&request.args).await?;
@@ -241,9 +242,35 @@ async fn dispatch(request: Request) -> Result<State> {
             let mut refreshed = state().await?;
             if let Some(mut group) = result {
                 group.collapsed = true;
-                refreshed
-                    .groups
-                    .retain(|current| current.id != format!("cached-{}", group.id));
+                let cached_id = format!("cached-{}", group.id);
+                refreshed.groups.retain(|current| current.id != cached_id);
+                for product in &mut refreshed.products {
+                    for section in &mut product.sections {
+                        section.groups.retain(|id| id != &cached_id);
+                    }
+                }
+                let device = request.args.get("device").and_then(Value::as_str);
+                for product in &mut refreshed.products {
+                    let owns_device = device.is_some_and(|device| {
+                        product
+                            .sections
+                            .iter()
+                            .flat_map(|section| &section.groups)
+                            .any(|id| {
+                                id == device
+                                    || id == &format!("openrazer:{device}")
+                                    || id.starts_with(&format!("input:{device}:"))
+                            })
+                    });
+                    if owns_device
+                        && let Some(section) = product
+                            .sections
+                            .iter_mut()
+                            .find(|section| section.id == "diagnostics")
+                    {
+                        section.groups.push(group.id.clone());
+                    }
+                }
                 refreshed.groups.push(group);
             }
             Ok(refreshed)

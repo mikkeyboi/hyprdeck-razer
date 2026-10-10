@@ -11,8 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub struct Node {
     pub id: String,
-    path: PathBuf,
-    name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) name: String,
 }
 pub fn nodes(device: &usb::Device) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
@@ -301,6 +301,11 @@ pub fn snapshot(node: &Node, controller: bool, rear: bool) -> Snapshot {
         ),
     )
     .collapsed();
+    group.rows.push(Row::info("kernel-name", "Native kernel input name", if controller && node.name.starts_with("Generic X-Box pad") {
+        format!("{} — xpad's native name is unchanged. The original 1532:0a3f identity lacks a named entry in the upstream driver table; a product display label does not rename this kernel device or create headset/battery support.", node.name)
+    } else {
+        node.name.clone()
+    }));
     let sample = open(node).and_then(|device| {
         let state = read_state(&device)?;
         let rows = rows_from_state(&device, &state)?;

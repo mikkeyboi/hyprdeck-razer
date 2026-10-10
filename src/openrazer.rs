@@ -1,5 +1,8 @@
 use crate::{Group, Row, string_arg};
+#[path = "openrazer_controls.rs"]
+mod controls;
 use anyhow::{Context, Result, bail};
+pub use controls::{configure, product_groups};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
@@ -16,9 +19,9 @@ struct Argument {
     signature: String,
 }
 #[derive(Clone, Debug)]
-struct Method {
-    interface: String,
-    name: String,
+pub(crate) struct Method {
+    pub(crate) interface: String,
+    pub(crate) name: String,
     input: Vec<Argument>,
     output: Vec<Argument>,
 }
@@ -52,6 +55,49 @@ impl Method {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+pub struct DeviceSnapshot {
+    pub serial: String,
+    methods: Vec<Method>,
+    values: BTreeMap<String, Result<Json, String>>,
+    pub diagnostics: Group,
+}
+
+impl DeviceSnapshot {
+    pub fn value(&self, interface: &str, member: &str) -> Option<&Json> {
+        self.values
+            .get(&format!("{interface}.{member}"))?
+            .as_ref()
+            .ok()
+    }
+
+    pub fn product_id(&self) -> Option<u16> {
+        let ids = self.value("razer.device.misc", "getVidPid")?.as_array()?;
+        if ids.first()?.as_u64()? != 0x1532 {
+            return None;
+        }
+        u16::try_from(ids.get(1)?.as_u64()?).ok()
+    }
+
+    pub fn battery(&self) -> Option<crate::Battery> {
+        let percentage = self.value("razer.device.power", "getBattery")?.as_f64()?;
+        if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+            return None;
+        }
+        Some(crate::Battery {
+            percentage: Some(percentage),
+            charging: self
+                .value("razer.device.power", "isCharging")
+                .and_then(Json::as_bool),
+            source: "OpenRazer getBattery / isCharging".into(),
+        })
+    }
+}
+
+pub struct Snapshot {
+    pub devices: Vec<DeviceSnapshot>,
+    pub status: Option<Group>,
 }
 fn parse_methods(xml: &str) -> Result<Vec<Method>> {
     let document = roxmltree::Document::parse_with_options(
@@ -466,7 +512,7 @@ fn native_control(
         None
     }
 }
-async fn device_group(connection: &Connection, serial: &str) -> Result<Group> {
+async fn device_snapshot(connection: &Connection, serial: &str) -> Result<DeviceSnapshot> {
     let path = path(serial)?;
     let methods = introspect(connection, &path).await?;
     let reads = stream::iter(
@@ -553,49 +599,92 @@ async fn device_group(connection: &Connection, serial: &str) -> Result<Group> {
     if methods.is_empty() {
         group.rows.push(Row::info("empty", "No exported device controls", "Daemon object exists but exports no razer.device.* capabilities; check driver/daemon compatibility."));
     }
-    Ok(group)
+    Ok(DeviceSnapshot {
+        serial: serial.into(),
+        methods,
+        values,
+        diagnostics: group.collapsed(),
+    })
 }
-async fn collect() -> Result<Vec<Group>> {
+async fn collect() -> Result<Snapshot> {
     let connection = connection().await?;
+    let names = zbus::fdo::DBusProxy::new(&connection).await?;
+    if !names.name_has_owner(BUS.try_into()?).await? {
+        bail!(
+            "OpenRazer daemon is not running; start it after completing device permissions setup"
+        );
+    }
     let serials = serials(&connection)
         .await
         .context("org.razer discovery; OpenRazer daemon may not be running")?;
-    let mut groups = Vec::new();
-    if serials.is_empty() {
-        let mut group = Group::new("openrazer", "OpenRazer", "Daemon running");
-        group.rows.push(Row::info("none", "No supported daemon devices", "USB discovery still lists all connected Razer devices. Check OpenRazer's supported-device list and kernel module; Wolverine is not made configurable merely by installing OpenRazer."));
-        groups.push(group);
-    }
     let queries = stream::iter(serials.iter().map(|serial| {
         let connection = &connection;
-        async move {
-            match device_group(connection, serial).await {
-                Ok(group) => group,
-                Err(error) => {
-                    let mut group = Group::new(
-                        format!("openrazer:{serial}"),
-                        "OpenRazer device unavailable",
-                        "Removal or daemon error",
-                    );
-                    group.rows.push(Row::info(
-                        "error",
-                        "Device query failed",
-                        format!("{error:#}"),
-                    ));
-                    group
-                }
-            }
-        }
+        async move { device_snapshot(connection, serial).await }
     }))
     .buffer_unordered(4);
-    groups.extend(queries.collect::<Vec<_>>().await);
-    Ok(groups)
-}
-pub async fn state() -> Vec<Group> {
-    match tokio::time::timeout(Duration::from_secs(3), collect()).await.unwrap_or_else(|_| Err(anyhow::anyhow!("OpenRazer state timed out after 3 seconds; native input diagnostics remain available"))) {
-        Ok(groups) => groups,
-        Err(error) => { let mut group = Group::new("openrazer", "OpenRazer unavailable", "Native USB/controller diagnostics remain independent"); group.rows.push(Row::info("daemon", "Daemon / session bus status", format!("{error:#}. Install the distribution's OpenRazer kernel modules and openrazer-daemon, then run the daemon in your user session following https://openrazer.github.io/#download . Follow OpenRazer's own device permissions setup (separate from evdev seat ACLs). This Rust plugin does not require python-openrazer and never installs packages automatically."))); vec![group] }
+    let mut devices = Vec::new();
+    let mut issues = Group::new(
+        "openrazer",
+        "OpenRazer status",
+        "User-session device capability service",
+    );
+    for result in queries.collect::<Vec<_>>().await {
+        match result {
+            Ok(device) => devices.push(device),
+            Err(error) => issues.rows.push(Row::info(
+                format!("error-{}", issues.rows.len()),
+                "Device query unavailable",
+                format!("{error:#}"),
+            )),
+        }
     }
+    devices.sort_by(|a, b| a.serial.cmp(&b.serial));
+    if devices.is_empty() && issues.rows.is_empty() {
+        issues.rows.push(Row::info("none", "No supported daemon devices", "Daemon is running, but no supported peripheral is exposed. Check modules and OpenRazer device permissions. Wolverine configuration is not supplied by OpenRazer."));
+    }
+    Ok(Snapshot {
+        devices,
+        status: (!issues.rows.is_empty()).then_some(issues),
+    })
+}
+pub async fn state() -> Snapshot {
+    match tokio::time::timeout(Duration::from_secs(3), collect())
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("OpenRazer state timed out after 3 seconds")))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut group = Group::new(
+                "openrazer",
+                "Mouse configuration setup",
+                "Native USB and controller input remain available",
+            );
+            group.rows.push(Row::info("daemon", "OpenRazer unavailable", format!("{error:#}. Install matching OpenRazer kernel modules and openrazer-daemon, follow its device permissions, then run the daemon in your desktop session. No automatic installation or hardware writes.")).controlled(json!({"kind":"button","label":"Open setup instructions","action":"openrazer-setup","args":{},"destructive":false})));
+            Snapshot {
+                devices: Vec::new(),
+                status: Some(group),
+            }
+        }
+    }
+}
+
+pub async fn setup() -> Result<()> {
+    let connection = connection().await?;
+    let options: BTreeMap<&str, zbus::zvariant::Value<'_>> = BTreeMap::new();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(3),
+        connection.call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.OpenURI"),
+            "OpenURI",
+            &("", "https://openrazer.github.io/#download", options),
+        ),
+    )
+    .await
+    .context("Desktop portal setup request timed out")??;
+    let _: zbus::zvariant::OwnedObjectPath = reply.body().deserialize()?;
+    Ok(())
 }
 pub async fn action(args: &Json) -> Result<Group> {
     let serial = string_arg(args, "device")?;

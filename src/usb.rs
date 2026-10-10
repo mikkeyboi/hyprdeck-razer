@@ -83,15 +83,14 @@ impl Device {
     }
 
     pub fn controller_group(&self, inputs: Option<Vec<ControllerInput>>, status: &str) -> Group {
-        let name = if self.product_id == 0x0a3f {
-            "Wolverine V3 Pro"
-        } else {
-            &self.name
+        let name = match self.product_id {
+            0x0a3f => "Wolverine V3 Pro",
+            0x0a57 | 0x0a59 => "Wolverine V3 Pro 8K PC",
+            _ => &self.name,
         };
         let connection = match self.product_id {
-            0x0a59 => "2.4 GHz USB receiver",
-            0x0a57 => "Wired USB input identity",
-            _ if self.name.contains("2.4") => "2.4 GHz USB receiver",
+            0x0a3f | 0x0a59 => "2.4 GHz USB receiver",
+            0x0a57 => "Wired USB",
             _ => "USB connected · transport undetermined",
         };
         let mut group = Group::new(
@@ -113,8 +112,6 @@ impl Device {
         } else {
             "500 ms view sampling; physical polling limits are not inferred from this USB identity. Measurement and USB scheduling details are separate."
         }));
-        group.rows.push(Row::info("mapping", "Button mapping · inspect only", "Onboard assignments are not exposed by xpad. Use Razer Controller Setup for Xbox on Windows/Xbox; select diagram inputs to inspect outputs."));
-        group.rows.push(Row::info("rgb", "RGB / lighting · unsupported here", "No native controller lighting write API. Genuine OpenRazer lighting for supported peripherals remains in expert details."));
         if self.product_id == 0x0a3f {
             group.rows.push(Row::info("firmware-check", "Firmware · official Windows updater", "Installed firmware is unreadable here. Check the offered updater; no comparison or Linux flash.").controlled(json!({"kind":"button","label":"Check vendor updater","action":"firmware-check","args":{"device":self.id},"destructive":false})));
             group.rows.push(Row::info("vendor-page", "Windows firmware instructions", "Follow the official controller/dongle updater prompts on a Windows PC.").controlled(json!({"kind":"button","label":"Open official support page","action":"vendor-page","args":{"device":self.id},"destructive":false})));
@@ -212,7 +209,7 @@ impl Device {
             group.rows.push(Row::info("controller-limits", "Physical polling limits", if self.product_id == 0x0a3f {
                 "Original Wolverine V3 Pro: vendor documents up to 250 Hz wireless and 1000 Hz wired PC Tournament Mode (Function + Menu + A). A 4 ms wireless USB endpoint does not become 1000 Hz via a Linux interval override. The 8K PC model is different hardware."
             } else {
-                "1532:0a57/0a59 appear in the upstream xpad support patch as Xbox 360-style wired/wireless identities. Do not infer original-model or 8K physical polling limits from those IDs alone."
+                "1532:0a57 wired and 0a59 wireless are Wolverine V3 Pro 8K PC identities documented in OpenRazer issue #2569 and upstream xpad support. They are distinct from original 0a3f; advertised physical polling is not inferred from endpoint scheduling or UI sampling."
             }));
         }
         if self.product_id == 0x0a3f {
