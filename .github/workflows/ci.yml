@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - name: Check protocol without hardware
+        shell: bash
+        run: |
+          printf '%s\n' '{"api_version":1,"method":"state","action":null,"args":{}}' | target/release/hyprdeck-razer --request | jq -e '.api_version == 1 and .error == null and (.state.groups | type == "array")'
+          printf '%s\n' '{"api_version":2,"method":"state","args":{}}' | target/release/hyprdeck-razer --request | jq -e '.api_version == 1 and (.error | type == "string") and .state == null'
