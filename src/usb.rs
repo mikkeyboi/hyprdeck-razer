@@ -1,4 +1,4 @@
-use crate::{Group, Row};
+use crate::{ControllerInput, Group, Row, Visualization};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::fs;
@@ -78,15 +78,62 @@ fn interval_us(speed: f64, interval: u16) -> Option<u64> {
     }
 }
 impl Device {
+    pub fn is_controller(&self) -> bool {
+        matches!(self.product_id, 0x0a3f | 0x0a57 | 0x0a59)
+    }
+
+    pub fn controller_group(&self, inputs: Option<Vec<ControllerInput>>, status: &str) -> Group {
+        let name = if self.product_id == 0x0a3f {
+            "Wolverine V3 Pro"
+        } else {
+            &self.name
+        };
+        let connection = match self.product_id {
+            0x0a59 => "2.4 GHz USB receiver",
+            0x0a57 => "Wired USB input identity",
+            _ if self.name.contains("2.4") => "2.4 GHz USB receiver",
+            _ => "USB connected · transport undetermined",
+        };
+        let mut group = Group::new(
+            format!("controller:{}", self.id),
+            name,
+            "Live standard inputs · select a button or stick to inspect",
+        );
+        if self.product_id == 0x0a3f || inputs.is_some() {
+            group.visualization = Some(Visualization::Controller {
+                name: name.into(),
+                connection: connection.into(),
+                status: status.into(),
+                inputs: inputs.unwrap_or_else(crate::input::unknown_controller_inputs),
+            });
+        }
+        group.rows.push(Row::info("connection", connection, status));
+        group.rows.push(Row::info("polling", "Polling & live view", if self.product_id == 0x0a3f {
+            "Up to 250 Hz wireless · 1000 Hz wired PC Tournament Mode (Function + Menu + A). UI sampling is separate; no interval override."
+        } else {
+            "500 ms view sampling; physical polling limits are not inferred from this USB identity. Measurement and USB scheduling details are separate."
+        }));
+        group.rows.push(Row::info("mapping", "Button mapping · inspect only", "Onboard assignments are not exposed by xpad. Use Razer Controller Setup for Xbox on Windows/Xbox; select diagram inputs to inspect outputs."));
+        group.rows.push(Row::info("rgb", "RGB / lighting · unsupported here", "No native controller lighting write API. Genuine OpenRazer lighting for supported peripherals remains in expert details."));
+        if self.product_id == 0x0a3f {
+            group.rows.push(Row::info("firmware-check", "Firmware · official Windows updater", "Installed firmware is unreadable here. Check the offered updater; no comparison or Linux flash.").controlled(json!({"kind":"button","label":"Check vendor updater","action":"firmware-check","args":{"device":self.id},"destructive":false})));
+            group.rows.push(Row::info("vendor-page", "Windows firmware instructions", "Follow the official controller/dongle updater prompts on a Windows PC.").controlled(json!({"kind":"button","label":"Open official support page","action":"vendor-page","args":{"device":self.id},"destructive":false})));
+        } else {
+            group.rows.push(Row::info("firmware", "Firmware · vendor model required", "Installed proprietary firmware is not readable via xpad/evdev. The verified original 0a3f updater is not offered for this different USB identity."));
+        }
+        group
+    }
+
     pub fn group(&self) -> Group {
         let mut group = Group::new(
             &self.id,
-            &self.name,
+            format!("USB details · {}", self.name),
             format!(
                 "Connected USB 1532:{:04x} at {} ({:.0} Mbit/s)",
                 self.product_id, self.port, self.speed
             ),
-        );
+        )
+        .collapsed();
         group.rows.push(Row::info("usb-id", "USB identity", format!("1532:{:04x}; {}. IDs identify observed USB personality, not proprietary capabilities.", self.product_id, self.port)));
         group.rows.push(Row::info(
             "serial",

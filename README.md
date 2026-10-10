@@ -2,10 +2,13 @@
 
 Standalone Rust backend for [Hyprdeck](https://github.com/mikkeyboi/hyprdeck). No Razer code is linked into Hyprdeck. The plugin executes as an explicitly trusted, unsandboxed subprocess and also provides a diagnostic CLI.
 
+Version **0.2.0** adds a live controller diagram without changing the native xpad setup or controller settings. Firmware and measurement actions remain explicit; there are no profile, RGB, calibration or polling writes on refresh.
+
 ## Capabilities and limitations
 
 | Path | Available behavior | Limits |
 | --- | --- | --- |
+| Live controller diagram | Wolverine `0a3f` front/rear input inspection; detected `0a57`/`0a59` gamepad inputs; pressed standard buttons, D-pad directions, normalized sticks and analog trigger travel | Samples kernel state, not every input event. Unobservable controls are unknown, not falsely released. Independent M1–M6 state and onboard mappings are not available. No diagram mapping/RGB write control is fabricated. |
 | Linux USB sysfs | Enumerates every connected vendor `1532` device, including Wolverine `0a3f`, Basilisk Ultimate `0088`, Mouse Dock `007e`, and other Razer peripherals; product/serial, driver, speed, descriptor revision, interrupt-IN scheduling and runtime power state | USB enumeration does not establish controller radio connection or proprietary capabilities. No sysfs writes or kernel-driver replacement. IDs use USB port topology; refresh after moving ports. |
 | Read-only, nonexclusive evdev | Current supported controller buttons and absolute axes initialized with kernel ioctls; compact keyboard/mouse button state, relative-axis capabilities; explicit timed changed-input-frame cadence measurement | Never grabs, injects input, sets force feedback or opens devices for writing. Relative mouse movement has no persistent absolute position. Steam/games keep receiving input. Removal and permission failures are explicit. |
 | OpenRazer user-session D-Bus | Live introspection of **every exported `razer.device.*` method** per supported daemon device. Available firmware/driver/serial/device metadata, battery/charging, DPI/stages/max/available DPI, polling/supported rates, brightness, each lighting zone/effect/color/speed/direction, power settings, keyboard/device-specific controls, custom frame methods and other exported methods | Exhaustive exported API is not exhaustive proprietary hardware support. Controls only exist if introspected on the connected daemon object. Getter values may be OpenRazer's cached/persistent state, not hardware readback. Unknown battery sentinel is explicitly unavailable. Compound controls use real typed arguments, not guessed USB packets. |
@@ -15,6 +18,26 @@ Standalone Rust backend for [Hyprdeck](https://github.com/mikkeyboi/hyprdeck). N
 Wolverine onboard profiles, independent paddle assignments, trigger-lock positions, proprietary battery and installed firmware are unavailable via standard xpad/evdev. You can see the resulting mapped standard inputs, not independently read these physical/proprietary settings. OpenRazer does not become a Wolverine configuration backend just because it is installed.
 
 The xpad [kernel support patch](https://git.kernel.org/pub/scm/linux/kernel/git/stable/stable-queue.git/plain/queue-6.19/input-xpad-add-support-for-razer-wolverine-v3-pro.patch?id=29da4200730c8c1565729677fb61d23daa174e7f) adds `1532:0a57` wired and `1532:0a59` wireless Xbox 360-style input support. The observed original wireless USB identity here is `1532:0a3f` (Xbox One-style xpad). Do not infer original/8K physical rates from the other IDs alone. The plugin supports native input discovery for all of them without replacing xpad. The [SteamOS-specific community wired paddle driver](https://github.com/Netruk44/wolverine-v3-pro-linux) is not a general configuration/firmware protocol and is not installed by this plugin.
+
+## Controller view
+
+On a visualization-capable Hyprdeck host, Wolverine's main card starts with the native controller diagram, connection information and a short capability summary instead of a stack of raw key/axis records. Select a front button, trigger, D-pad direction or stick to inspect its output; use the input selector for keyboard-accessible selection. Switch to the rear view to inspect M1–M6 limitations. Pressed standard outputs highlight, sticks display their sampled position, and triggers display normalized travel. Selecting a hotspot **does not remap anything**.
+
+The backend opens evdev nodes **read-only and nonexclusively** and queries `EVIOCGKEY`/`EVIOCGABS`; even an idle controller has initialized supported button and axis values. Axis normalization uses each kernel-advertised minimum/maximum, clamps to valid diagram bounds, and reports invalid/missing ranges as unknown. Signed sticks normalize each side around exact zero, so the asymmetric xpad range `−32768..32767` still centers at zero; unsigned ranges use their midpoint. Stick Y is negative upwards, matching xpad's evdev output; no dead zone, inversion, sensitivity or calibration is written. The Xbox face-button labels follow upstream xpad's `BTN_A/B/X/Y` aliases: `SOUTH=A`, `EAST=B`, `NORTH=X`, `WEST=Y`—the latter two Linux constant names are not their Xbox physical positions.
+
+Refresh targets **500 ms while a known Wolverine USB identity is present**, otherwise **2000 ms**, and only while the host view is mapped. Request/service latency can make actual updates slower; this is a sampled UI, not a 500 ms hardware polling setting, and brief presses between snapshots may not appear. USB receiver presence and a readable kernel snapshot do not independently prove an active radio link. Removal/permission failures replace readings with unknown state rather than keeping stale values. For `0a57`/`0a59`, a diagram is supplied only when a readable node exports actual gamepad button/stick capabilities; those IDs do not imply a particular physical polling limit or independent six-button rear layout. M1–M6 unknown inspection slots are supplied only for the verified original `0a3f` layout.
+
+| Controller opportunity | What Hyprdeck actually provides | Configuration prerequisite / boundary |
+| --- | --- | --- |
+| Button mapping | Inspect standard mapped outputs by selecting front controls; M1–M6 remain explicitly unknown | Native xpad cannot read/write assignments or tell which independent extra button generated the output. Use model-supported profiles in **Razer Controller Setup for Xbox** on Windows/Xbox. |
+| RGB / lighting | Clear unsupported capability description; no imaginary color picker | No native xpad/evdev controller lighting write API has been established. Consult the vendor app for your model's options. Other peripherals' genuine OpenRazer lighting controls remain available in expert details. |
+| Polling | Safe original-model 250 Hz wireless / 1000 Hz wired PC Tournament Mode guidance plus explicit changed-input measurement | Wired shortcut is `Function + Menu + A`. The diagram refresh rate, endpoint schedule and changed-event cadence are different quantities; no Linux interval override is offered. |
+| Firmware | Original `0a3f` official offered-updater check and Windows instructions | Installed proprietary firmware is unreadable here; the check is neither a version comparison nor a Linux flash. No original-model updater is offered for the other USB identities. |
+
+Expand **USB details**, **Input details**, historical measurement/vendor results, **OpenRazer** or **Firmware support** for all existing raw diagnostics and supported exported API controls. These groups are initially collapsed; no source-supported OpenRazer method is removed. A completed measurement/vendor action is returned under expert details and its cached historical result retains its timestamp. New 0.2.0 results also provide a concise recorded summary directly in the controller card, so explicit actions have visible feedback without expanding raw records; older 0.1.0 cache entries remain available in expert details. Original-model firmware and detected-input measurement actions are also reachable directly from the main card.
+
+The optional visualization schema is vendor-independent: fixed controller input IDs and ordinary declarative controls, not vendor paths, shell commands or arbitrary SVG. Other plugins can provide the same diagram data and attach a mapping control only when their real backend supports that operation. This Razer backend attaches **no** mapping controls because native xpad provides no such capability.
+
 
 ## Build and install
 
@@ -72,7 +95,9 @@ printf '%s\n' '{"api_version":1,"method":"state","action":null,"args":{}}' | hyp
 printf '%s\n' '{"api_version":1,"method":"action","action":"measure","args":{"device":"input:usb:1-11:event256","seconds":4}}' | hyprdeck-razer --request
 ```
 
-Responses are `{ "api_version": 1, "error": null, "state": { "title": ..., "description": ..., "groups": [...] } }`. Errors return a string and `state: null`. Actions return refreshed state and their completed result. One request/process, no shell evaluation. The host timeout is 15 seconds; the backend deadline is 13 seconds. Measurements accept 1–8 seconds; normal state does not measure or perform vendor network checks. OpenRazer reads are bounded and concurrent; its 3-second state budget cannot prevent native USB/input diagnostics. Stale cached measurements are labeled historical with their timestamp and are never called current polling.
+Responses are `{ "api_version": 1, "error": null, "state": { "title": ..., "description": ..., "groups": [...], "refresh_interval_ms": 500 } }` while a controller is present (`2000` otherwise). Errors return a string and `state: null`. Actions return refreshed state and their completed result. One request/process, no shell evaluation. The host timeout is 15 seconds; the backend deadline is 13 seconds. Measurements accept 1–8 seconds; normal state does not measure or perform vendor network checks. OpenRazer reads are bounded and concurrent; its 3-second state budget cannot prevent native USB/input diagnostics. Stale cached measurements are labeled historical with their timestamp and are never called current polling.
+
+Version 0.2.0 keeps API version **1** and all row/action fallbacks. Each group adds optional `visualization` and `collapsed` (default false); `visualization.kind="controller"` carries `name`, `connection`, `status` and `inputs`. Inputs contain `id`, `label`, `detail`, optional `pressed`, `value` (0..1), `x`/`y` (−1..1) and `control`. `null` means unknown/unobservable, not false or zero. The host recognizes these additive fields; old hosts ignore them and continue displaying the summary, raw diagnostic rows and existing genuine controls. Previously cached 0.1.0 groups still deserialize with defaults. No higher manifest API requirement or compatibility shim is needed.
 
 ### OpenRazer control arguments
 
@@ -131,7 +156,7 @@ Only that validated 40-hex-character device ID reaches `fwupdmgr update`. No for
 
 CI checks formatting, Clippy, real protocol/type/cadence error-boundary tests, independent release compilation and headless subprocess envelopes. It does not pretend to test connected hardware or an absent OpenRazer daemon. Release builds use Ubuntu 22.04 x86-64 for a conservative glibc baseline rather than distributing an Arch-local binary.
 
-The release workflow runs on `v*` tags, or manual dispatch with an **existing** tag. Keep `Cargo.toml` and `plugin.json` versions identical, then create/push the corresponding tag (for example `v0.1.0`). It checks exact repository/manifest/tag identity and publishes three standalone stable-release assets:
+The release workflow runs on `v*` tags, or manual dispatch with an **existing** tag. Keep `Cargo.toml`, the root package in `Cargo.lock` and `plugin.json` versions identical, then create/push the corresponding tag (for example `v0.2.0`). It checks exact repository/manifest/tag identity and publishes three standalone stable-release assets:
 
 - `hyprdeck-razer-linux-x86_64` — the single executable
 - `plugin.json` — exact version-1 host manifest
@@ -151,5 +176,6 @@ This implementation follows live D-Bus introspection and these upstream definiti
 - [Device/firmware metadata](https://github.com/openrazer/openrazer/blob/master/daemon/openrazer_daemon/dbus_services/dbus_methods/all.py), [shared lighting/keyboard methods](https://github.com/openrazer/openrazer/blob/master/daemon/openrazer_daemon/dbus_services/dbus_methods/chroma_keyboard.py), and [device-specific methods directory](https://github.com/openrazer/openrazer/tree/master/daemon/openrazer_daemon/dbus_services/dbus_methods).
 - [fwupd D-Bus API](https://github.com/fwupd/fwupd/blob/main/src/org.freedesktop.fwupd.xml) and [supported/updatable device flags](https://github.com/fwupd/fwupd/blob/main/libfwupd/fwupd-device.rs).
 - [Linux input event semantics](https://docs.kernel.org/input/event-codes.html), including `SYN_DROPPED` recovery.
+- [Upstream xpad Xbox button/axis output](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c) and [Linux UAPI button aliases](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h).
 
 Licensed MIT; API references remain their upstream licenses. Razer and OpenRazer are independent projects; this is not a vendor-endorsed firmware tool.

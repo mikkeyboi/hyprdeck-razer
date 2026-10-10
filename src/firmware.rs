@@ -52,7 +52,7 @@ pub async fn vendor_check(args: &Value) -> Result<Group> {
     usb::require_original(id)?;
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
-        .user_agent("hyprdeck-razer/0.1.0")
+        .user_agent(concat!("hyprdeck-razer/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::custom(|attempt| {
             if attempt.previous().len() >= 6 {
                 attempt.error("Too many official redirects")
@@ -77,7 +77,14 @@ pub async fn vendor_check(args: &Value) -> Result<Group> {
         response.url().as_str(),
     ));
     group.rows.push(Row::info("instructions", "Windows prerequisite / explicit manual update", format!("Use a Windows PC and follow {VENDOR_PAGE}; close applications using the controller, maintain power and follow the updater's dongle/controller connection prompts. Hyprdeck does not launch Wine, flash packets or change xpad.")));
-    crate::cache::store("firmware", id, &group)?;
+    let summary = Row::info(
+        "last-firmware-check",
+        "Last vendor check · available updater",
+        format!(
+            "Windows updater v{version}; installed firmware remains unknown. Not a newer-than-installed claim."
+        ),
+    );
+    crate::cache::store("firmware", id, &group, &summary)?;
     Ok(group)
 }
 pub async fn open_page(args: &Value) -> Result<()> {

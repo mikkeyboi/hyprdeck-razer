@@ -2,8 +2,8 @@
   "api_version": 1,
   "id": "razer",
   "name": "Razer peripherals",
-  "description": "OpenRazer controls and Wolverine diagnostics",
-  "version": "0.1.0",
+  "description": "Live controller visualization, OpenRazer controls and expert diagnostics",
+  "version": "0.2.0",
   "executable": "hyprdeck-razer",
   "update_repo": "mikkeyboi/hyprdeck-razer",
   "asset": "hyprdeck-razer-linux-x86_64"

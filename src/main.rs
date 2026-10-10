@@ -28,6 +28,7 @@ pub struct State {
     title: String,
     description: String,
     groups: Vec<Group>,
+    refresh_interval_ms: u64,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Group {
@@ -35,6 +36,38 @@ pub struct Group {
     title: String,
     description: String,
     rows: Vec<Row>,
+    #[serde(default)]
+    visualization: Option<Visualization>,
+    #[serde(default)]
+    collapsed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Visualization {
+    Controller {
+        name: String,
+        connection: String,
+        status: String,
+        inputs: Vec<ControllerInput>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ControllerInput {
+    id: String,
+    label: String,
+    detail: String,
+    #[serde(default)]
+    pressed: Option<bool>,
+    #[serde(default)]
+    value: Option<f64>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    control: Option<Value>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Row {
@@ -72,7 +105,13 @@ impl Group {
             title: title.into(),
             description: description.into(),
             rows: Vec::new(),
+            visualization: None,
+            collapsed: false,
         }
+    }
+    pub fn collapsed(mut self) -> Self {
+        self.collapsed = true;
+        self
     }
 }
 pub fn string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -83,17 +122,52 @@ pub fn string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 async fn state() -> Result<State> {
     let devices = usb::devices()?;
+    let controller_present = devices.iter().any(usb::Device::is_controller);
     let mut groups = Vec::new();
+    let mut details = Vec::new();
     for device in &devices {
-        groups.push(device.group());
-        if let Some(result) = cache::load("firmware", &device.id) {
-            groups.push(result);
+        details.push(device.group());
+        let mut summaries = Vec::new();
+        if let Some((result, summary)) = cache::load("firmware", &device.id) {
+            summaries.extend(summary);
+            details.push(result.collapsed());
         }
+        let mut live_inputs = None;
+        let mut measurement = None;
+        let mut input_error = false;
         for node in input::nodes(device)? {
-            groups.push(input::snapshot(&node));
-            if let Some(result) = cache::load("measurement", &node.id) {
-                groups.push(result);
+            let sample =
+                input::snapshot(&node, device.is_controller(), device.product_id == 0x0a3f);
+            let selected = live_inputs.is_none() && sample.inputs.is_some();
+            if selected {
+                live_inputs = sample.inputs;
+                measurement = Some(input::measurement_row(&node));
             }
+            input_error |= sample.error.is_some();
+            details.push(sample.group);
+            if let Some((result, summary)) = cache::load("measurement", &node.id) {
+                if selected {
+                    summaries.extend(summary);
+                }
+                details.push(result.collapsed());
+            }
+        }
+        if device.is_controller() {
+            let status = if live_inputs.is_some() && device.product_id == 0x0a57 {
+                "Kernel input available · 500 ms sampled"
+            } else if live_inputs.is_some() {
+                "Kernel input available · 500 ms sampled · radio status unavailable"
+            } else if input_error {
+                "Input unavailable · inspect permissions/removal in input details"
+            } else {
+                "USB present · no readable controller input node"
+            };
+            let mut group = device.controller_group(live_inputs, status);
+            if let Some(row) = measurement {
+                group.rows.push(row);
+            }
+            group.rows.extend(summaries);
+            groups.push(group);
         }
     }
     if devices.is_empty() {
@@ -101,13 +175,15 @@ async fn state() -> Result<State> {
         group.rows.push(Row::info("none", "No connected Razer USB device", "No device with USB vendor 1532 is currently enumerated. Reconnect and refresh; no stale device records are retained."));
         groups.push(group);
     }
+    groups.extend(details);
     let (openrazer, firmware) = tokio::join!(openrazer::state(), firmware::state());
-    groups.extend(openrazer);
-    groups.extend(firmware);
+    groups.extend(openrazer.into_iter().map(Group::collapsed));
+    groups.extend(firmware.into_iter().map(Group::collapsed));
     Ok(State {
         title: "Razer peripherals".into(),
-        description: "Live sysfs/evdev diagnostics and capabilities exported by OpenRazer. Reads never grab input devices or change settings. USB scheduling, configured rate and measured changed-event cadence are distinct.".into(),
+        description: "Live controllers and genuine peripheral capabilities. Select inputs to inspect; expand expert details for USB, evdev, OpenRazer and firmware diagnostics. Native controller settings stay unchanged.".into(),
         groups,
+        refresh_interval_ms: if controller_present { 500 } else { 2000 },
     })
 }
 
@@ -163,11 +239,12 @@ async fn dispatch(request: Request) -> Result<State> {
                 ),
             };
             let mut refreshed = state().await?;
-            if let Some(group) = result {
+            if let Some(mut group) = result {
+                group.collapsed = true;
                 refreshed
                     .groups
                     .retain(|current| current.id != format!("cached-{}", group.id));
-                refreshed.groups.insert(0, group);
+                refreshed.groups.push(group);
             }
             Ok(refreshed)
         }

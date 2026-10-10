@@ -1,6 +1,7 @@
-use crate::{Group, Row, usb};
+use crate::{ControllerInput, Group, Row, usb};
 use anyhow::{Context, Result, bail};
 use evdev::raw_stream::RawDevice;
+use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, AttributeSetRef, KeyCode};
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -44,12 +45,211 @@ fn open(node: &Node) -> Result<RawDevice> {
     RawDevice::from_fd(file.into())
         .context("Reading evdev capabilities; input may have been removed")
 }
+struct KernelState {
+    keys: Option<AttributeSet<KeyCode>>,
+    // Linux ABS_MAX is 0x3f; keep the small ioctl result on the stack.
+    axes: [Option<AbsInfo>; 64],
+}
+
+fn read_state(device: &RawDevice) -> Result<KernelState> {
+    let keys = device
+        .supported_keys()
+        .map(|_| device.get_key_state())
+        .transpose()
+        .context("EVIOCGKEY initial button state (device removed?)")?;
+    let mut axes = [None; 64];
+    if device.supported_absolute_axes().is_some() {
+        for (axis, info) in device
+            .get_absinfo()
+            .context("EVIOCGABS initial axes (device removed?)")?
+        {
+            axes[usize::from(axis.0)] = Some(info);
+        }
+    }
+    Ok(KernelState { keys, axes })
+}
+
+fn normalized(info: &AbsInfo) -> Option<f64> {
+    let minimum = f64::from(info.minimum());
+    let maximum = f64::from(info.maximum());
+    (maximum > minimum)
+        .then(|| ((f64::from(info.value()) - minimum) / (maximum - minimum)).clamp(0.0, 1.0))
+}
+
+fn normalized_stick(info: &AbsInfo) -> Option<f64> {
+    if info.minimum() < 0 && info.maximum() > 0 {
+        let value = f64::from(info.value());
+        let extent = if value < 0.0 {
+            -f64::from(info.minimum())
+        } else {
+            f64::from(info.maximum())
+        };
+        Some((value / extent).clamp(-1.0, 1.0))
+    } else {
+        normalized(info).map(|value| value * 2.0 - 1.0)
+    }
+}
+
+// xpad reports BTN_A/B/X/Y, whose Linux UAPI aliases are SOUTH/EAST/NORTH/WEST.
+// Do not interpret NORTH/WEST as the physical positions on an Xbox controller.
+const BUTTONS: [(&str, &str, KeyCode); 11] = [
+    ("a", "A", KeyCode::BTN_SOUTH),
+    ("b", "B", KeyCode::BTN_EAST),
+    ("x", "X", KeyCode::BTN_NORTH),
+    ("y", "Y", KeyCode::BTN_WEST),
+    ("lb", "Left bumper · LB", KeyCode::BTN_TL),
+    ("rb", "Right bumper · RB", KeyCode::BTN_TR),
+    ("view", "View", KeyCode::BTN_SELECT),
+    ("menu", "Menu", KeyCode::BTN_START),
+    ("guide", "Xbox / Guide", KeyCode::BTN_MODE),
+    ("left_stick", "Left stick · L3", KeyCode::BTN_THUMBL),
+    ("right_stick", "Right stick · R3", KeyCode::BTN_THUMBR),
+];
+
+fn controller_inputs(
+    supported: Option<&AttributeSetRef<KeyCode>>,
+    state: Option<&KernelState>,
+    rear: bool,
+) -> Vec<ControllerInput> {
+    let pressed = |key| {
+        supported
+            .filter(|keys| keys.contains(key))
+            .and_then(|_| state?.keys.as_ref().map(|keys| keys.contains(key)))
+    };
+    let axis = |code: AbsoluteAxisCode| state?.axes[usize::from(code.0)].as_ref();
+    let mut inputs = Vec::with_capacity(if rear { 23 } else { 17 });
+    for (id, label, key) in BUTTONS {
+        let mut input = ControllerInput {
+            id: id.into(),
+            label: label.into(),
+            detail: format!(
+                "Standard Xbox output ({key:?}). Inspect-only: onboard mapping is not readable or writable via xpad/evdev. A mapped extra button can produce this same output."
+            ),
+            pressed: pressed(key),
+            value: None,
+            x: None,
+            y: None,
+            control: None,
+        };
+        let stick = match id {
+            "left_stick" => Some((AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)),
+            "right_stick" => Some((AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)),
+            _ => None,
+        };
+        if let Some((x, y)) = stick {
+            input.x = axis(x).and_then(normalized_stick);
+            input.y = axis(y).and_then(normalized_stick);
+            input.detail = "Position uses the kernel's advertised axis ranges: −1..1, negative Y is up. Stick click is the standard L3/R3 output. No dead zone, sensitivity, profile or calibration setting is changed.".into();
+        }
+        inputs.push(input);
+    }
+    for (id, label, code, key) in [
+        (
+            "lt",
+            "Left trigger · LT",
+            AbsoluteAxisCode::ABS_Z,
+            KeyCode::BTN_TL2,
+        ),
+        (
+            "rt",
+            "Right trigger · RT",
+            AbsoluteAxisCode::ABS_RZ,
+            KeyCode::BTN_TR2,
+        ),
+    ] {
+        inputs.push(ControllerInput {
+            id: id.into(),
+            label: label.into(),
+            detail: "Analog travel is normalized to 0..1 using the kernel's advertised range. A digital-only trigger is reported only if the device exports its button. Physical trigger-lock position is not readable.".into(),
+            pressed: pressed(key),
+            value: axis(code).and_then(normalized),
+            x: None,
+            y: None,
+            control: None,
+        });
+    }
+    for (id, label, code, negative, key) in [
+        (
+            "dpad_up",
+            "D-pad up",
+            AbsoluteAxisCode::ABS_HAT0Y,
+            true,
+            KeyCode::BTN_DPAD_UP,
+        ),
+        (
+            "dpad_down",
+            "D-pad down",
+            AbsoluteAxisCode::ABS_HAT0Y,
+            false,
+            KeyCode::BTN_DPAD_DOWN,
+        ),
+        (
+            "dpad_left",
+            "D-pad left",
+            AbsoluteAxisCode::ABS_HAT0X,
+            true,
+            KeyCode::BTN_DPAD_LEFT,
+        ),
+        (
+            "dpad_right",
+            "D-pad right",
+            AbsoluteAxisCode::ABS_HAT0X,
+            false,
+            KeyCode::BTN_DPAD_RIGHT,
+        ),
+    ] {
+        inputs.push(ControllerInput {
+            id: id.into(),
+            label: label.into(),
+            detail: "Standard D-pad output, read from the supported hat axis or digital button. Diagonal directions can both be active.".into(),
+            pressed: axis(code)
+                .filter(|info| info.minimum() < 0 && info.maximum() > 0)
+                .map(|info| if negative { info.value() < 0 } else { info.value() > 0 })
+                .or_else(|| pressed(key)),
+            value: None,
+            x: None,
+            y: None,
+            control: None,
+        });
+    }
+    if rear {
+        for index in 1..=6 {
+            inputs.push(ControllerInput {
+                id: format!("m{index}"),
+                label: format!("Extra button · M{index}"),
+                detail: "Independent press and onboard assignment are unavailable via standard xpad/evdev. Pressing a mapped extra button may highlight its assigned standard output on the front, not identify this button. Use Razer Controller Setup for Xbox on a supported Windows/Xbox system; Hyprdeck cannot read or write that profile.".into(),
+                pressed: None,
+                value: None,
+                x: None,
+                y: None,
+                control: None,
+            });
+        }
+    }
+    inputs
+}
+
+pub fn unknown_controller_inputs() -> Vec<ControllerInput> {
+    controller_inputs(None, None, true)
+}
+
+pub struct Snapshot {
+    pub group: Group,
+    pub inputs: Option<Vec<ControllerInput>>,
+    pub error: Option<String>,
+}
+
 fn initialized_rows(device: &RawDevice) -> Result<Vec<Row>> {
+    rows_from_state(device, &read_state(device)?)
+}
+
+fn rows_from_state(device: &RawDevice, state: &KernelState) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     if let Some(keys) = device.supported_keys() {
-        let state = device
-            .get_key_state()
-            .context("EVIOCGKEY initial button state (device removed?)")?;
+        let state = state
+            .keys
+            .as_ref()
+            .context("Missing queried button state")?;
         if device.supported_absolute_axes().is_some() {
             for key in keys.iter() {
                 rows.push(Row::info(
@@ -66,11 +266,11 @@ fn initialized_rows(device: &RawDevice) -> Result<Vec<Row>> {
             rows.push(Row::info("key-state", "Current buttons / keyboard keys", format!("Pressed: {:?}. Supported: {:?}. All other supported keys are released (fresh EVIOCGKEY).", state.iter().collect::<Vec<_>>(), keys.iter().collect::<Vec<_>>())));
         }
     }
-    if device.supported_absolute_axes().is_some() {
-        for (axis, info) in device
-            .get_absinfo()
-            .context("EVIOCGABS initial axes (device removed?)")?
-        {
+    if let Some(axes) = device.supported_absolute_axes() {
+        for axis in axes.iter() {
+            let info = state.axes[usize::from(axis.0)]
+                .as_ref()
+                .context("Missing queried axis state")?;
             rows.push(Row::info(
                 format!("abs-{}", axis.0),
                 format!("{axis:?} (0x{:02x})", axis.0),
@@ -91,28 +291,60 @@ fn initialized_rows(device: &RawDevice) -> Result<Vec<Row>> {
     }
     Ok(rows)
 }
-pub fn snapshot(node: &Node) -> Group {
+pub fn snapshot(node: &Node, controller: bool, rear: bool) -> Snapshot {
     let mut group = Group::new(
         &node.id,
-        &node.name,
+        format!("Input details · {}", node.name),
         format!(
             "{} — nonexclusive read-only evdev snapshot",
             node.path.display()
         ),
-    );
-    match open(node).and_then(|device| initialized_rows(&device)) {
-        Ok(rows) => {
+    )
+    .collapsed();
+    let sample = open(node).and_then(|device| {
+        let state = read_state(&device)?;
+        let rows = rows_from_state(&device, &state)?;
+        let gamepad = controller
+            && device
+                .supported_keys()
+                .is_some_and(|keys| keys.contains(KeyCode::BTN_SOUTH))
+            && device.supported_absolute_axes().is_some_and(|axes| {
+                axes.contains(AbsoluteAxisCode::ABS_X) && axes.contains(AbsoluteAxisCode::ABS_Y)
+            });
+        let inputs =
+            gamepad.then(|| controller_inputs(device.supported_keys(), Some(&state), rear));
+        Ok((rows, inputs))
+    });
+    match sample {
+        Ok((rows, inputs)) => {
             group.rows.push(Row::info("status", "Live input initialized", "Buttons and absolute axes queried directly with EVIOCGKEY/EVIOCGABS, even when idle. Input remains available to Steam/games. Snapshots refresh when Hyprdeck is mapped; no event history or rate is fabricated."));
             group.rows.extend(rows);
-            group.rows.push(Row::info("measurement", "Changed input-frame cadence", "Move sticks/triggers or the mouse continuously for four seconds. This measures evdev SYN_REPORT frames containing changed standard input, not every USB packet or internal sensor poll.").controlled(json!({"kind":"button","label":"Measure input (4 s)","action":"measure","args":{"device":node.id,"seconds":4},"destructive":false})));
+            group.rows.push(measurement_row(node));
+            Snapshot {
+                group,
+                inputs,
+                error: None,
+            }
         }
-        Err(error) => group.rows.push(Row::info(
-            "status",
-            "Input unavailable / permission or removal",
-            format!("{error:#}"),
-        )),
+        Err(error) => {
+            let error = format!("{error:#}");
+            group.rows.push(Row::info(
+                "status",
+                "Input unavailable / permission or removal",
+                &error,
+            ));
+            Snapshot {
+                group,
+                inputs: None,
+                error: Some(error),
+            }
+        }
     }
-    group
+}
+
+pub fn measurement_row(node: &Node) -> Row {
+    Row::info("measurement", "Measure input cadence", "Move sticks/triggers continuously for four seconds. Changed evdev frames are measured, not every USB packet or internal poll.")
+        .controlled(json!({"kind":"button","label":"Measure input (4 s)","action":"measure","args":{"device":node.id,"seconds":4},"destructive":false}))
 }
 fn find(id: &str) -> Result<Node> {
     for device in usb::devices()? {
@@ -266,12 +498,33 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
             }
         }
     }
+    let elapsed = start.elapsed();
+    let summary = Row::info(
+        "last-measurement",
+        "Last input measurement",
+        if cadence.frames < 2 {
+            format!(
+                "{} changed frames in {:.2} s · no polling estimate. SYN_DROPPED: {}.",
+                cadence.frames,
+                elapsed.as_secs_f64(),
+                cadence.drops
+            )
+        } else {
+            format!(
+                "{} changed frames in {:.2} s · {:.1} changed frames/s, not physical polling. SYN_DROPPED: {}.",
+                cadence.frames,
+                elapsed.as_secs_f64(),
+                cadence.frames as f64 / elapsed.as_secs_f64(),
+                cadence.drops
+            )
+        },
+    );
     group.rows.insert(
         0,
         Row::info(
             "cadence",
             "Observed changed input-frame cadence",
-            cadence.description(start.elapsed()),
+            cadence.description(elapsed),
         ),
     );
     group.rows.insert(
@@ -295,7 +548,7 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
         row.id = format!("final-{}", row.id);
         group.rows.push(row);
     }
-    crate::cache::store("measurement", id, &group)?;
+    crate::cache::store("measurement", id, &group, &summary)?;
     Ok(group)
 }
 
@@ -317,5 +570,144 @@ mod tests {
         cadence.feed(&evdev::InputEvent::new(0, 0, 0));
         assert_eq!(cadence.frames, 1);
         assert!(cadence.intervals.is_empty());
+    }
+
+    #[test]
+    fn normalization_uses_advertised_ranges_and_clamps() {
+        let axis = |value, minimum, maximum| AbsInfo::new(value, minimum, maximum, 0, 0, 0);
+        assert_eq!(normalized(&axis(-32768, -32768, 32767)), Some(0.0));
+        assert_eq!(normalized(&axis(32767, -32768, 32767)), Some(1.0));
+        assert_eq!(normalized(&axis(512, 0, 1024)), Some(0.5));
+        assert_eq!(normalized(&axis(-9, 0, 1023)), Some(0.0));
+        assert_eq!(normalized(&axis(2048, 0, 1023)), Some(1.0));
+        assert_eq!(normalized(&axis(0, 0, 0)), None);
+        assert_eq!(normalized(&axis(0, 1, -1)), None);
+        assert_eq!(normalized(&axis(i32::MIN, i32::MIN, i32::MAX)), Some(0.0));
+        assert_eq!(normalized(&axis(i32::MAX, i32::MIN, i32::MAX)), Some(1.0));
+        assert_eq!(normalized_stick(&axis(0, -32768, 32767)), Some(0.0));
+        assert_eq!(normalized_stick(&axis(-32768, -32768, 32767)), Some(-1.0));
+        assert_eq!(normalized_stick(&axis(32767, -32768, 32767)), Some(1.0));
+        assert_eq!(normalized_stick(&axis(-300, -100, 100)), Some(-1.0));
+        assert_eq!(normalized_stick(&axis(300, -100, 100)), Some(1.0));
+        assert_eq!(normalized_stick(&axis(50, 0, 100)), Some(0.0));
+        assert_eq!(normalized_stick(&axis(0, 0, 0)), None);
+        assert_eq!(normalized_stick(&axis(0, 1, -1)), None);
+        assert_eq!(
+            normalized_stick(&axis(i32::MIN, i32::MIN, i32::MAX)),
+            Some(-1.0)
+        );
+    }
+
+    #[test]
+    fn xbox_buttons_and_idle_axes_are_initialized() {
+        // Fixed UAPI codes independently assert Xbox aliases, especially X/Y.
+        let expected = [
+            ("a", 304),
+            ("b", 305),
+            ("x", 307),
+            ("y", 308),
+            ("lb", 310),
+            ("rb", 311),
+            ("view", 314),
+            ("menu", 315),
+            ("guide", 316),
+            ("left_stick", 317),
+            ("right_stick", 318),
+        ];
+        let supported: AttributeSet<KeyCode> =
+            expected.iter().map(|(_, code)| KeyCode(*code)).collect();
+        for (id, code) in expected {
+            let mut keys = AttributeSet::new();
+            keys.insert(KeyCode(code));
+            let mut state = KernelState {
+                keys: Some(keys),
+                axes: [None; 64],
+            };
+            state.axes[0] = Some(AbsInfo::new(0, -32768, 32767, 0, 0, 0));
+            state.axes[1] = Some(AbsInfo::new(-32768, -32768, 32767, 0, 0, 0));
+            state.axes[2] = Some(AbsInfo::new(0, 0, 1023, 0, 0, 0));
+            state.axes[16] = Some(AbsInfo::new(-1, -1, 1, 0, 0, 0));
+            state.axes[17] = Some(AbsInfo::new(0, -1, 1, 0, 0, 0));
+            let inputs = controller_inputs(Some(&supported), Some(&state), true);
+            for (candidate, _, _) in BUTTONS {
+                assert_eq!(
+                    inputs
+                        .iter()
+                        .find(|input| input.id == candidate)
+                        .unwrap()
+                        .pressed,
+                    Some(candidate == id)
+                );
+            }
+            let stick = inputs
+                .iter()
+                .find(|input| input.id == "left_stick")
+                .unwrap();
+            assert_eq!((stick.x, stick.y), (Some(0.0), Some(-1.0)));
+            assert_eq!(
+                inputs.iter().find(|input| input.id == "lt").unwrap().value,
+                Some(0.0)
+            );
+            assert_eq!(
+                inputs
+                    .iter()
+                    .find(|input| input.id == "dpad_left")
+                    .unwrap()
+                    .pressed,
+                Some(true)
+            );
+            assert_eq!(
+                inputs
+                    .iter()
+                    .find(|input| input.id == "dpad_right")
+                    .unwrap()
+                    .pressed,
+                Some(false)
+            );
+            assert_eq!(
+                inputs
+                    .iter()
+                    .find(|input| input.id == "dpad_up")
+                    .unwrap()
+                    .pressed,
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_and_unsupported_inputs_are_unknown_not_released() {
+        let unknown = unknown_controller_inputs();
+        assert_eq!(unknown.len(), 23);
+        assert!(unknown.iter().all(|input| input.pressed.is_none()
+            && input.value.is_none()
+            && input.x.is_none()
+            && input.y.is_none()
+            && input.control.is_none()));
+        let supported: AttributeSet<KeyCode> = [KeyCode::BTN_SOUTH].into_iter().collect();
+        let missing = controller_inputs(Some(&supported), None, true);
+        assert!(missing.iter().all(|input| input.pressed.is_none()));
+        let state = KernelState {
+            keys: Some(AttributeSet::new()),
+            axes: [None; 64],
+        };
+        let inputs = controller_inputs(Some(&supported), Some(&state), true);
+        assert_eq!(
+            inputs.iter().find(|input| input.id == "a").unwrap().pressed,
+            Some(false)
+        );
+        assert_eq!(
+            inputs.iter().find(|input| input.id == "b").unwrap().pressed,
+            None
+        );
+        assert!(
+            inputs
+                .iter()
+                .filter(|input| input.id.starts_with('m') && input.id != "menu")
+                .all(|input| input.pressed.is_none() && input.control.is_none())
+        );
+        let generic = controller_inputs(Some(&supported), Some(&state), false);
+        assert_eq!(generic.len(), 17);
+        assert!(!generic.iter().any(|input| input.id == "m1"));
     }
 }

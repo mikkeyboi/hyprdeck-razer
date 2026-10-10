@@ -11,6 +11,8 @@ struct Entry {
     identity: String,
     unix_seconds: u64,
     group: Group,
+    #[serde(default)]
+    summary: Option<Row>,
 }
 fn root() -> Result<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
@@ -43,11 +45,11 @@ fn identity(id: &str) -> Result<String> {
         crate::usb::text(device.path.join("serial")).unwrap_or_default()
     ))
 }
-pub fn store(kind: &str, id: &str, group: &Group) -> Result<()> {
+pub fn store(kind: &str, id: &str, group: &Group, summary: &Row) -> Result<()> {
     // Serialization borrows the result rather than copying its rows.
     let identity = identity(id)?;
     let unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let value = serde_json::json!({"identity":identity,"unix_seconds":unix_seconds,"group":group});
+    let value = serde_json::json!({"identity":identity,"unix_seconds":unix_seconds,"group":group,"summary":summary});
     let path = file(kind, id)?;
     fs::create_dir_all(path.parent().context("Missing cache parent")?)?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -64,7 +66,7 @@ pub fn store(kind: &str, id: &str, group: &Group) -> Result<()> {
     }
     result
 }
-pub fn load(kind: &str, id: &str) -> Option<Group> {
+pub fn load(kind: &str, id: &str) -> Option<(Group, Option<Row>)> {
     let path = file(kind, id).ok()?;
     let metadata = fs::symlink_metadata(&path).ok()?;
     if !metadata.file_type().is_file() || metadata.len() > 1024 * 1024 {
@@ -81,5 +83,11 @@ pub fn load(kind: &str, id: &str) -> Option<Group> {
         entry.unix_seconds, entry.group.description
     );
     entry.group.rows.insert(0, Row::info("recorded", "Historical explicit result", format!("Recorded at Unix timestamp {}. Live input is the separate current ioctl snapshot; this result is not automatically remeasured or rechecked.",entry.unix_seconds)));
-    Some(entry.group)
+    if let Some(summary) = &mut entry.summary {
+        summary.subtitle.push_str(&format!(
+            " Recorded Unix timestamp {}; not automatically rechecked.",
+            entry.unix_seconds
+        ));
+    }
+    Some((entry.group, entry.summary))
 }
