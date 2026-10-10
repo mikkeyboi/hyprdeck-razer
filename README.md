@@ -4,6 +4,15 @@ Standalone Rust backend for [Hyprdeck](https://github.com/mikkeyboi/hyprdeck). N
 
 Version **0.2.0** adds a live controller diagram without changing the native xpad setup or controller settings. Firmware and measurement actions remain explicit; there are no profile, RGB, calibration or polling writes on refresh.
 
+<p align="center">
+  <img src="docs/screenshots/controller-front.png" width="49%" alt="Wolverine front view with neutral libadwaita theme and live input inspector">
+  <img src="docs/screenshots/controller-rear.png" width="49%" alt="Wolverine rear view with neutral theme and unavailable independent paddle state">
+</p>
+
+Neutral libadwaita screenshots of the native controller view, using a captured real Wolverine
+kernel-state snapshot. Rear artwork is a generic layout; dashed controls are unavailable, not
+independently mapped or reported buttons. No hardware state was simulated for these images.
+
 ## Capabilities and limitations
 
 | Path | Available behavior | Limits |
