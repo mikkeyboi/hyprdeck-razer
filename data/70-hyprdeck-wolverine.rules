@@ -1,0 +1,5 @@
+# Wolverine V4 Pro PC HID only. Keep all input interfaces bound to the kernel.
+# Active-seat access is scoped to this controller, never other keyboards/mice.
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0a79", ENV{ID_USB_INTERFACE_NUM}=="01", TAG+="uaccess"
+# Native keyboard assignments emit through this controller's input interfaces.
+ACTION=="add|change", SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="0a79", TAG+="uaccess"

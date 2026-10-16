@@ -2,10 +2,69 @@ use super::*;
 #[path = "dpi_presets.rs"]
 mod presets;
 pub use presets::action as dpi_presets;
+#[path = "battery_notifications.rs"]
+mod notifications;
+pub use notifications::action as battery_notifications;
 
 const DPI: &str = "razer.device.dpi";
 const MISC: &str = "razer.device.misc";
 const POWER: &str = "razer.device.power";
+
+const SYNC_ZONES: [(&str, &str); 6] = [
+    ("razer.device.lighting.logo", "Logo"),
+    ("razer.device.lighting.scroll", "Scroll"),
+    ("razer.device.lighting.left", "Left"),
+    ("razer.device.lighting.right", "Right"),
+    ("razer.device.lighting.backlight", "Backlight"),
+    ("razer.device.lighting.chroma", ""),
+];
+
+fn sync_zones(device: &DeviceSnapshot) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+    SYNC_ZONES.into_iter().filter(move |(interface, prefix)| {
+        device.methods.iter().any(|method| {
+            method.interface == *interface
+                && method
+                    .name
+                    .strip_prefix("set")
+                    .and_then(|name| name.strip_prefix(prefix))
+                    .is_some_and(|suffix| effects().iter().any(|(name, _, _, _)| *name == suffix))
+        })
+    })
+}
+
+fn sync_effect_options(device: &DeviceSnapshot) -> Vec<Json> {
+    effects()
+        .iter()
+        .filter(|(suffix, effect, _, signature)| {
+            matches!(
+                *effect,
+                "static" | "spectrum" | "wave" | "breathSingle" | "breathRandom" | "none"
+            ) && sync_zones(device).all(|(interface, prefix)| {
+                method(
+                    device,
+                    interface,
+                    &format!("set{prefix}{suffix}"),
+                    signature,
+                )
+                .is_some()
+            })
+        })
+        .map(|(_, effect, label, _)| json!({"value":effect,"label":label}))
+        .collect()
+}
+
+fn sync_has_brightness(device: &DeviceSnapshot) -> bool {
+    method(
+        device,
+        "razer.device.lighting.brightness",
+        "setBrightness",
+        "d",
+    )
+    .is_some()
+        || sync_zones(device).all(|(interface, prefix)| {
+            method(device, interface, &format!("set{prefix}Brightness"), "d").is_some()
+        })
+}
 
 fn method<'a>(
     device: &'a DeviceSnapshot,
@@ -133,8 +192,8 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
     let mut groups = Vec::new();
     let mut sensitivity = Group::new(
         format!("settings:{}:dpi", device.serial),
-        format!("{component} sensitivity"),
-        "Device DPI and daemon-configured polling; Apply is explicit",
+        "Pointer Sensitivity & Polling",
+        "",
     );
     let has_device_stages = method(device, DPI, "getDPIStages", "").is_some()
         && method(device, DPI, "setDPIStages", "ya(qq)").is_some();
@@ -142,7 +201,9 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         .value(DPI, "availableDPI")
         .and_then(Json::as_array)
         .filter(|values| !values.is_empty());
-    let host_presets = matches!(device.product_id(), Some(0x0086 | 0x0088))
+    let host_presets = device
+        .product_id()
+        .is_some_and(|pid| (0x0001..=0x00ff).contains(&pid) && pid != 0x007e && pid != 0x00a4)
         && available.is_none()
         && !has_device_stages
         && method(device, DPI, "getDPI", "").is_some()
@@ -225,7 +286,7 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
             .iter()
             .any(|option| option["value"].as_str() == Some(current_rate.as_str()))
         {
-            sensitivity.rows.push(Row::info("polling", "Configured polling", "Device-advertised rates, or verified OpenRazer Basilisk defaults; not a controller override.").controlled(json!({"kind":"choice","value":current.to_string(),"options":options,"action":"openrazer-configure","args":{"device":device.serial,"operation":"polling"}})));
+            sensitivity.rows.push(Row::info("polling", "Polling rate", "USB report rate (Hz)").controlled(json!({"kind":"choice","value":current.to_string(),"options":options,"action":"openrazer-configure","args":{"device":device.serial,"operation":"polling"}})));
         }
     }
     if let (Some(stages), Some(max)) = (
@@ -234,53 +295,49 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
             .and_then(Json::as_array)
             .filter(|values| values.len() == 2),
         max_dpi(device),
-    ) {
-        if let Some(pairs) = stages[1].as_array().filter(|pairs| {
-            !pairs.is_empty()
-                && pairs.len() <= 5
-                && pairs
-                    .iter()
-                    .all(|pair| pair.as_array().is_some_and(|pair| pair.len() == 2))
-        }) && method(device, DPI, "setDPIStages", "ya(qq)").is_some()
-            && integer(&stages[0], 1, pairs.len() as u64).is_ok()
+    ) && let Some(pairs) = stages[1].as_array().filter(|pairs| {
+        !pairs.is_empty()
+            && pairs.len() <= 5
             && pairs
                 .iter()
-                .all(|pair| validate_dpi(device, &pair[0], &pair[1]).is_ok())
-        {
-            let mut fields = vec![number_field(
-                "active",
-                "Active stage (one-based)",
-                &stages[0],
-                1.0,
-                pairs.len() as f64,
-            )];
-            for (index, pair) in pairs.iter().enumerate() {
-                fields.push(number_field(
-                    &format!("x{}", index + 1),
-                    &format!("Stage {} horizontal DPI", index + 1),
-                    &pair[0],
-                    100.0,
-                    max as f64,
-                ));
-                fields.push(number_field(
-                    &format!("y{}", index + 1),
-                    &format!("Stage {} vertical DPI", index + 1),
-                    &pair[1],
-                    100.0,
-                    max as f64,
-                ));
-            }
-            sensitivity.rows.push(
-                Row::info(
-                    "stages",
-                    "DPI stages",
-                    "Edit the actual device stage table and select the active stage.",
-                )
-                .controlled(form(device, "stages", DPI, fields)),
-            );
+                .all(|pair| pair.as_array().is_some_and(|pair| pair.len() == 2))
+    }) && method(device, DPI, "setDPIStages", "ya(qq)").is_some()
+        && integer(&stages[0], 1, pairs.len() as u64).is_ok()
+        && pairs
+            .iter()
+            .all(|pair| validate_dpi(device, &pair[0], &pair[1]).is_ok())
+    {
+        let mut fields = vec![number_field(
+            "active",
+            "Active stage (one-based)",
+            &stages[0],
+            1.0,
+            pairs.len() as f64,
+        )];
+        for (index, pair) in pairs.iter().enumerate() {
+            fields.push(number_field(
+                &format!("x{}", index + 1),
+                &format!("Stage {} horizontal DPI", index + 1),
+                &pair[0],
+                100.0,
+                max as f64,
+            ));
+            fields.push(number_field(
+                &format!("y{}", index + 1),
+                &format!("Stage {} vertical DPI", index + 1),
+                &pair[1],
+                100.0,
+                max as f64,
+            ));
         }
-    } else if matches!(device.product_id(), Some(0x0086 | 0x0088)) {
-        sensitivity.rows.push(Row::info("host-presets", "Host presets, not onboard stages", "Save stores editable presets on this computer only. Apply, activate and next/previous explicitly call setDPI. The physical DPI-cycle button does not use host presets; refresh only reads the current daemon DPI."));
+        sensitivity.rows.push(
+            Row::info(
+                "stages",
+                "DPI stages",
+                "Edit the actual device stage table and select the active stage.",
+            )
+            .controlled(form(device, "stages", DPI, fields)),
+        );
     }
     if !sensitivity.rows.is_empty() {
         groups.push(("sensitivity", sensitivity));
@@ -302,16 +359,11 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
     {
         let mut group = Group::new(
             format!("settings:{}:brightness", device.serial),
-            format!("{component} brightness"),
-            "Actual OpenRazer brightness interface",
+            format!("{component} Brightness"),
+            "",
         );
         group.rows.push(
-            Row::info(
-                "brightness",
-                "Brightness",
-                "Percent · applies to this component, not mouse logo/scroll zones",
-            )
-            .controlled(numeric(
+            Row::info("brightness", "Brightness (%)", "0–100%").controlled(numeric(
                 device,
                 "razer.device.lighting.brightness",
                 "setBrightness",
@@ -322,14 +374,68 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         );
         groups.push(("lighting", group));
     }
-    for (zone, prefix, title) in [
-        ("logo", "Logo", "Mouse logo"),
-        ("scroll", "Scroll", "Scroll wheel"),
-        ("left", "Left", "Left lighting strip"),
-        ("right", "Right", "Right lighting strip"),
+    let zone_defs = [
+        ("logo", "Logo", "Mouse Logo"),
+        ("scroll", "Scroll", "Scroll Wheel"),
+        ("left", "Left", "Left Side Strip"),
+        ("right", "Right", "Right Side Strip"),
         ("backlight", "Backlight", "Backlight"),
-        ("chroma", "", "Dock / Chroma lighting"),
-    ] {
+        ("chroma", "", "Chroma Lighting"),
+        ("charging", "Charging", "Charging State"),
+        ("fast_charging", "FastCharging", "Fast Charging State"),
+        ("fully_charged", "FullyCharged", "Fully Charged State"),
+    ];
+    let active_zone_count = zone_defs
+        .iter()
+        .filter(|(zone, _, _)| {
+            let iface = format!("razer.device.lighting.{zone}");
+            device.methods.iter().any(|m| m.interface == iface)
+        })
+        .count();
+    let mut sync_options = sync_effect_options(device);
+    if sync_zones(device).count() > 1 && !sync_options.is_empty() {
+        let mut sync = Group::new(
+            format!("settings:{}:sync", device.serial),
+            format!("{component} · Unified Chroma Sync"),
+            "Chosen values are commands, not shared device readback. Only effects exported by every primary lighting zone are offered; charging-state zones remain separate.",
+        );
+        let has_wave = sync_options.iter().any(|option| option["value"] == "wave");
+        sync_options.push(json!({"value":"keep","label":"Select an effect to apply"}));
+        let mut fields = vec![
+            choice_field("effect", "Lighting effect to apply", "keep", sync_options),
+            json!({"id":"color","label":"Color to apply (colored effects)","kind":"color","value":"#00FF66","options":[]}),
+        ];
+        if has_wave {
+            fields.push(choice_field(
+                "direction",
+                "Wave direction to apply",
+                "1",
+                vec![
+                    json!({"value":"1","label":"Direction 1"}),
+                    json!({"value":"2","label":"Direction 2"}),
+                ],
+            ));
+        }
+        if sync_has_brightness(device) {
+            fields.push(number_field(
+                "brightness",
+                "Brightness to apply (%)",
+                &json!(100),
+                0.0,
+                100.0,
+            ));
+        }
+        sync.rows.push(
+            Row::info(
+                "sync-effect",
+                "Sync primary lighting zones",
+                "Apply the selected effect to each exported primary lighting zone",
+            )
+            .controlled(form(device, "sync", "razer.device.lighting", fields)),
+        );
+        groups.push(("lighting", sync));
+    }
+    for (zone, prefix, title) in zone_defs {
         let interface = format!("razer.device.lighting.{zone}");
         if !device
             .methods
@@ -341,8 +447,15 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         let mut group = Group::new(
             format!("settings:{}:{zone}", device.serial),
             format!("{component} · {title}"),
-            "OpenRazer zone state; no writes on refresh",
+            if active_zone_count > 1 {
+                "Individual zone override"
+            } else {
+                ""
+            },
         );
+        if active_zone_count > 1 {
+            group = group.collapsed();
+        }
         let brightness = format!("get{prefix}Brightness");
         let setter = format!("set{prefix}Brightness");
         if let Some(value) = device.value(&interface, &brightness).filter(|value| {
@@ -352,12 +465,8 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         }) && method(device, &interface, &setter, "d").is_some()
         {
             group.rows.push(
-                Row::info(
-                    "brightness",
-                    "Brightness",
-                    "Percent · Apply changes only this component and zone",
-                )
-                .controlled(numeric(device, &interface, &setter, value, 0.0, 100.0)),
+                Row::info("brightness", "Zone brightness (%)", "")
+                    .controlled(numeric(device, &interface, &setter, value, 0.0, 100.0)),
             );
         }
         let effect_getter = format!("get{prefix}Effect");
@@ -386,10 +495,7 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
                 "static" | "breathSingle" => color1.is_some(),
                 "breathDual" => color1.is_some() && color2.is_some(),
                 "reactive" => color1.is_some() && speed.is_some(),
-                "wave" => {
-                    direction.is_some()
-                        && matches!(device.product_id(), Some(0x0086 | 0x0088 | 0x007e))
-                }
+                "wave" => direction.is_some(),
                 _ => true,
             };
             if supported && fields_known {
@@ -423,9 +529,7 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
                     4.0,
                 ));
             }
-            if let Some(value) =
-                direction.filter(|_| matches!(device.product_id(), Some(0x0086 | 0x0088 | 0x007e)))
-            {
+            if let Some(value) = direction {
                 fields.push(choice_field(
                     "direction",
                     "Wave direction",
@@ -436,12 +540,15 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
                     ],
                 ));
             }
-            group.rows.push(Row::info("effect", "Effect & colors", "Only parameters used by the selected effect are sent. Other zones are unchanged.").controlled(form(device, "effect", &interface, fields)));
+            group.rows.push(
+                Row::info("effect", "Effect & colors", "")
+                    .controlled(form(device, "effect", &interface, fields)),
+            );
         }
         if let Some(color) = color1 {
             let setter = format!("set{prefix}Static");
             if method(device, &interface, &setter, "yyy").is_some() {
-                group.rows.push(Row::info("color", "Static color", "Apply selects Static and this color for this zone.").controlled(json!({"kind":"color","value":color,"action":"openrazer-configure","args":{"device":device.serial,"operation":"color","interface":interface,"member":setter}})));
+                group.rows.push(Row::info("color", "Quick static color", "").controlled(json!({"kind":"color","value":color,"action":"openrazer-configure","args":{"device":device.serial,"operation":"color","interface":interface,"member":setter}})));
             }
         }
         if !group.rows.is_empty() {
@@ -465,16 +572,17 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
     {
         let mut charging = Group::new(
             format!("settings:{}:charging", device.serial),
-            format!("{component} charging indicator"),
-            "Real charging-light setters; no getter is exported for current charging color/effect",
-        );
-        charging.rows.push(Row::info("charge", "Charging light", "Choose explicitly: follow current mouse effect, or a supplied charging color. The empty color is a manual input, not a guessed current value; no action occurs until Apply.").controlled(form(device, "charging", "razer.device.lighting.power", vec![choice_field("mode", "Charging effect", "choose", vec![json!({"value":"choose","label":"Choose an effect"}), json!({"value":"0","label":"Use current mouse effect"}), json!({"value":"1","label":"Use custom charging color"})]), json!({"id":"color","label":"Custom charging color (#RRGGBB)","kind":"text","value":"","options":[]})])));
+            format!("{component} · Charging Indicator"),
+            "Setters only: these are explicit choices to apply, not the current charging effect or color",
+        )
+        .collapsed();
+        charging.rows.push(Row::info("charge", "Charging light", "No current effect/color readback is exported").controlled(form(device, "charging", "razer.device.lighting.power", vec![choice_field("mode", "Charging effect to apply", "0", vec![json!({"value":"0","label":"Use current mouse effect"}), json!({"value":"1","label":"Use custom charging color"})]), json!({"id":"color","label":"Custom charging color to apply","kind":"color","value":"#00FF66","options":[]})])));
         groups.push(("lighting", charging));
     }
     let mut power = Group::new(
         format!("settings:{}:power", device.serial),
-        format!("{component} power"),
-        "Actual device power controls",
+        "Wireless Power & Sleep",
+        "",
     );
     for (getter, setter, title, min, max, signature) in [
         (
@@ -488,7 +596,7 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
         (
             "getLowBatteryThreshold",
             "setLowBatteryThreshold",
-            "Low battery warning (%)",
+            "Hardware low-battery indicator threshold (%)",
             0.0,
             100.0,
             "y",
@@ -504,7 +612,11 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
                 Row::info(
                     getter,
                     title,
-                    "Read from the current daemon device; native hardware range",
+                    if getter == "getLowBatteryThreshold" {
+                        "Hardware indicator only; does not control desktop battery popups"
+                    } else {
+                        ""
+                    },
                 )
                 .controlled(numeric(device, POWER, setter, value, min, max)),
             );
@@ -512,6 +624,80 @@ pub fn product_groups(device: &DeviceSnapshot, component: &str) -> Vec<(&'static
     }
     if !power.rows.is_empty() {
         groups.push(("power", power));
+    }
+    if method(device, POWER, "getBattery", "").is_some() {
+        groups.push(("power", notifications::group(device)));
+    }
+    let mut toggles = Group::new(
+        format!("settings:{}:features", device.serial),
+        format!("{component} device features"),
+        "OpenRazer hardware toggles and scroll wheel controls",
+    );
+    for (iface, getter, setter, title, desc) in [
+        (
+            "razer.device.scroll",
+            "getScrollAcceleration",
+            "setScrollAcceleration",
+            "Scroll wheel acceleration",
+            "Dynamic scroll speed acceleration",
+        ),
+        (
+            "razer.device.scroll",
+            "getScrollSmartReel",
+            "setScrollSmartReel",
+            "Scroll wheel Smart-Reel",
+            "Automatic tactile-to-freespin switching",
+        ),
+    ] {
+        if let Some(val) = device.value(iface, getter).and_then(Json::as_bool)
+            && method(device, iface, setter, "b").is_some()
+        {
+            toggles
+                .rows
+                .push(Row::info(getter, title, desc).controlled(json!({
+                    "kind": "switch",
+                    "value": val,
+                    "action": "openrazer-configure",
+                    "args": {
+                        "device": device.serial,
+                        "operation": "boolean",
+                        "interface": iface,
+                        "member": setter
+                    }
+                })));
+        }
+    }
+    if let Some(val) = device
+        .value("razer.device.scroll", "getScrollMode")
+        .and_then(Json::as_u64)
+        .filter(|v| *v <= 1)
+        && method(device, "razer.device.scroll", "setScrollMode", "y").is_some()
+    {
+        toggles.rows.push(
+            Row::info(
+                "scroll-mode",
+                "Scroll wheel mode",
+                "Tactile notched vs free-spin scroll wheel mode",
+            )
+            .controlled(json!({
+                "kind": "choice",
+                "value": val.to_string(),
+                "options": [
+                    {"value": "0", "label": "Tactile"},
+                    {"value": "1", "label": "Free-spin"}
+                ],
+                "action": "openrazer-configure",
+                "args": {
+                    "device": device.serial,
+                    "operation": "choice-byte",
+                    "interface": "razer.device.scroll",
+                    "member": "setScrollMode"
+                }
+            })),
+        );
+    }
+    if !toggles.rows.is_empty() {
+        groups.push(("sensitivity", toggles));
     }
     groups
 }
@@ -629,6 +815,9 @@ fn arguments(device: &DeviceSnapshot, args: &Json) -> Result<(String, String, Ve
                 Some("right") => "Right",
                 Some("backlight") => "Backlight",
                 Some("chroma") => "",
+                Some("charging") => "Charging",
+                Some("fast_charging") => "FastCharging",
+                Some("fully_charged") => "FullyCharged",
                 _ => bail!("Unsupported RGB zone"),
             };
             let effect = field(value, "effect")?
@@ -654,9 +843,6 @@ fn arguments(device: &DeviceSnapshot, args: &Json) -> Result<(String, String, Ve
                 values.push(json!(integer(field(value, "speed")?, 1, 4)?));
             }
             if effect == "wave" {
-                if !matches!(device.product_id(), Some(0x0086 | 0x0088 | 0x007e)) {
-                    bail!("Wave directions for this model have not been established");
-                }
                 let direction = field(value, "direction")?
                     .as_str()
                     .context("Direction must be a choice string")?
@@ -665,9 +851,89 @@ fn arguments(device: &DeviceSnapshot, args: &Json) -> Result<(String, String, Ve
             }
             Ok((interface.into(), member, values))
         }
+        "boolean" => {
+            let interface = string_arg(args, "interface")?;
+            let member = string_arg(args, "member")?;
+            let b = value.as_bool().context("Expected boolean value")?;
+            Ok((interface.into(), member.into(), vec![json!(b)]))
+        }
+        "choice-byte" => {
+            let interface = string_arg(args, "interface")?;
+            let member = string_arg(args, "member")?;
+            let b = value
+                .as_str()
+                .context("Choice must be a string")?
+                .parse::<u64>()?;
+            Ok((
+                interface.into(),
+                member.into(),
+                vec![json!(integer(&json!(b), 0, 1)?)],
+            ))
+        }
         _ => bail!("Unknown product control operation"),
     }
 }
+fn sync_calls<'a>(
+    device: &'a DeviceSnapshot,
+    value: &Json,
+) -> Result<Vec<(&'a Method, Vec<Json>)>> {
+    if sync_zones(device).count() < 2 {
+        bail!("At least two primary lighting zones must be exported to synchronize");
+    }
+    let effect = field(value, "effect")?
+        .as_str()
+        .context("Choose a lighting effect to apply")?;
+    let &(suffix, _, _, signature) = effects()
+        .iter()
+        .find(|(_, name, _, _)| {
+            *name == effect
+                && matches!(
+                    *name,
+                    "static" | "spectrum" | "wave" | "breathSingle" | "breathRandom" | "none"
+                )
+        })
+        .context("Choose a supported shared effect; no unchanged/default write")?;
+    let values = match effect {
+        "static" | "breathSingle" => rgb(field(value, "color")?)?,
+        "wave" => {
+            let direction = field(value, "direction")?
+                .as_str()
+                .context("Wave direction must be a choice string")?
+                .parse::<u64>()?;
+            vec![json!(integer(&json!(direction), 1, 2)?)]
+        }
+        _ => Vec::new(),
+    };
+    let mut calls = Vec::new();
+    for (interface, prefix) in sync_zones(device) {
+        let member = format!("set{prefix}{suffix}");
+        let setter = method(device, interface, &member, signature).with_context(|| {
+            format!("Shared effect is not supported by {interface}; no writes sent")
+        })?;
+        calls.push((setter, values.clone()));
+    }
+    if let Some(brightness) = value.get("brightness") {
+        let brightness = json!(integer(brightness, 0, 100)?);
+        if let Some(setter) = method(
+            device,
+            "razer.device.lighting.brightness",
+            "setBrightness",
+            "d",
+        ) {
+            calls.push((setter, vec![brightness]));
+        } else {
+            for (interface, prefix) in sync_zones(device) {
+                let member = format!("set{prefix}Brightness");
+                let setter = method(device, interface, &member, "d").with_context(|| {
+                    format!("Shared brightness is not supported by {interface}; no writes sent")
+                })?;
+                calls.push((setter, vec![brightness.clone()]));
+            }
+        }
+    }
+    Ok(calls)
+}
+
 pub async fn configure(args: &Json) -> Result<Group> {
     let serial = string_arg(args, "device")?;
     let connection = connection().await?;
@@ -679,6 +945,30 @@ pub async fn configure(args: &Json) -> Result<Group> {
         bail!("OpenRazer device removed or unknown");
     }
     let device = device_snapshot(&connection, serial).await?;
+    if args.get("operation").and_then(Json::as_str) == Some("sync") {
+        let value = args.get("value").context("Missing form args.value")?;
+        let calls = sync_calls(&device, value)?;
+        let device_path = path(serial)?;
+        for (method, values) in &calls {
+            call(&connection, &device_path, method, values)
+                .await
+                .with_context(|| format!("{} failed; earlier lighting calls may already have been accepted. Refresh device state before applying again", method.id()))?;
+        }
+        let mut group = Group::new(
+            "openrazer-result",
+            "Unified Chroma Sync accepted",
+            "All requested calls were accepted by OpenRazer; this is not independent hardware readback",
+        );
+        group.rows.push(Row::info(
+            "result",
+            "Primary lighting-zone calls accepted",
+            format!(
+                "{} explicit lighting calls accepted. Charging-state zones were not changed.",
+                calls.len()
+            ),
+        ));
+        return Ok(group);
+    }
     if args.get("operation").and_then(Json::as_str) == Some("charging") {
         let value = args.get("value").context("Missing form args.value")?;
         let mode = field(value, "mode")?
@@ -739,6 +1029,39 @@ pub async fn configure(args: &Json) -> Result<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn sync_device() -> DeviceSnapshot {
+        let mut device = device();
+        device.methods = parse_methods("<node><interface name='razer.device.lighting.logo'><method name='setLogoStatic'><arg type='y' direction='in'/><arg type='y' direction='in'/><arg type='y' direction='in'/></method><method name='setLogoSpectrum'/><method name='setLogoWave'><arg type='i' direction='in'/></method><method name='setLogoBrightness'><arg type='d' direction='in'/></method></interface><interface name='razer.device.lighting.scroll'><method name='setScrollStatic'><arg type='y' direction='in'/><arg type='y' direction='in'/><arg type='y' direction='in'/></method><method name='setScrollSpectrum'/><method name='setScrollBrightness'><arg type='d' direction='in'/></method></interface></node>").unwrap();
+        // Basilisk also exports raw Chroma frames; that API is not another
+        // physical effect zone and must not suppress the common zone controls.
+        device.methods.extend(parse_methods("<node><interface name='razer.device.lighting.chroma'><method name='setCustom'/><method name='setKeyRow'><arg type='ay' direction='in'/></method></interface></node>").unwrap());
+        device
+    }
+    #[test]
+    fn shared_lighting_only_offers_and_preflights_common_capabilities() {
+        let mut device = sync_device();
+        let options = sync_effect_options(&device);
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option["value"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["spectrum", "static"]
+        );
+        assert!(sync_has_brightness(&device));
+        assert!(sync_calls(&device, &json!({"effect":"wave","direction":"1"})).is_err());
+        assert!(sync_calls(&device, &json!({"effect":"keep","brightness":50})).is_err());
+        assert!(sync_calls(&device, &json!({"effect":"static","color":"invalid"})).is_err());
+        device
+            .methods
+            .retain(|method| method.name != "setScrollBrightness");
+        assert!(!sync_has_brightness(&device));
+        assert!(sync_calls(&device, &json!({"effect":"spectrum","brightness":50})).is_err());
+        device
+            .methods
+            .retain(|method| method.interface != "razer.device.lighting.scroll");
+        assert!(sync_calls(&device, &json!({"effect":"spectrum"})).is_err());
+    }
     fn device() -> DeviceSnapshot {
         DeviceSnapshot {
             serial: "real-identity".into(),

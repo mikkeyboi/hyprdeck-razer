@@ -1,6 +1,6 @@
 use crate::{Battery, Group, Product, ProductSection, Row, cache, input, openrazer, remapper, usb};
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -13,10 +13,41 @@ fn section(id: &str, title: &str, groups: Vec<String>) -> ProductSection {
     }
 }
 fn controller_name(device: &usb::Device) -> &str {
-    match device.product_id {
-        0x0a3f => "Wolverine V3 Pro",
-        0x0a57 | 0x0a59 => "Wolverine V3 Pro 8K PC",
-        _ => &device.name,
+    device.controller_display_name()
+}
+
+fn map_daemon_kind(dtype: &str, pid: u16, name: &str) -> &'static str {
+    match dtype {
+        "mouse" => "mouse",
+        "keyboard" => "keyboard",
+        "keypad" => "keypad",
+        "headset" => "headset",
+        "mousemat" => "mousemat",
+        "accessory" | "core" | "monitor" => {
+            if matches!(pid, 0x007e | 0x00a4 | 0x0f21) || name.contains("Dock") {
+                "dock"
+            } else {
+                "accessory"
+            }
+        }
+        _ => "peripheral",
+    }
+}
+
+fn kind_description(kind: &str, basilisk_kit: bool) -> &'static str {
+    if basilisk_kit {
+        return "Mouse, wireless receiver and connected charging dock";
+    }
+    match kind {
+        "controller" => "Live inputs, connection status and firmware tools",
+        "mouse" => "Available sensitivity, lighting and power controls",
+        "keyboard" => "Backlight, Chroma effects and available device information",
+        "keypad" => "Gaming keypad lighting and software remapping tools",
+        "headset" => "Headset lighting and USB device status",
+        "mousemat" => "Chroma surface lighting and brightness controls",
+        "dock" => "Charging dock Chroma lighting and brightness controls",
+        "accessory" => "Chroma accessory lighting and device status",
+        _ => "Physical USB product · verified API capabilities only",
     }
 }
 fn product_sets(devices: &[usb::Device]) -> Vec<(String, Vec<usize>)> {
@@ -162,6 +193,14 @@ fn component_name(device: &usb::Device) -> &str {
         _ => &device.name,
     }
 }
+fn component_connection(device: &usb::Device) -> &'static str {
+    match device.product_id {
+        0x0088 => "2.4 GHz USB receiver",
+        0x0086 => "Wired USB",
+        0x007e => "USB charging dock",
+        _ => "USB",
+    }
+}
 pub fn assemble(
     devices: &[usb::Device],
     mut daemon: openrazer::Snapshot,
@@ -180,35 +219,44 @@ pub fn assemble(
             .find(|device| device.product_id == 0x0088)
             .copied()
             .unwrap_or(components[0]);
-        let mouse = matches!(primary.product_id, 0x0086 | 0x0088);
+        let basilisk = matches!(primary.product_id, 0x0086 | 0x0088);
         let controller = primary.is_controller();
-        let dock = primary.product_id == 0x007e;
-        let name = if mouse {
-            "Basilisk Ultimate"
+        let mut kind = if basilisk {
+            "mouse"
         } else if controller {
-            controller_name(primary)
-        } else if dock {
-            "Mouse Dock Chroma"
+            "controller"
         } else {
-            &primary.name
+            primary.inferred_kind()
         };
-        let connection = match primary.product_id {
-            0x0088 => "2.4 GHz USB receiver",
-            0x0086 => "Wired USB",
-            0x0a3f | 0x0a59 => "2.4 GHz USB receiver",
-            _ => "USB",
+        let mut display_name: String = if basilisk {
+            "Basilisk Ultimate".into()
+        } else if controller {
+            controller_name(primary).into()
+        } else if primary.product_id == 0x007e {
+            "Mouse Dock Chroma".into()
+        } else {
+            primary
+                .name
+                .strip_prefix("Razer ")
+                .unwrap_or(&primary.name)
+                .into()
+        };
+        let connection = if controller {
+            primary.controller_connection_label()
+        } else {
+            component_connection(primary)
         };
         let mut summary = Group::new(
             format!("{id}:overview"),
             if controller {
-                "Current connection"
+                "Connection Details"
             } else {
-                name
+                &display_name
             },
             if controller {
-                "Observed kernel driver and USB scheduling"
+                ""
             } else {
-                "Physical product and its connected components"
+                "Connected hardware & firmware status"
             },
         );
         let mut diagnostics = Vec::new();
@@ -216,37 +264,17 @@ pub fn assemble(
         let mut battery = None;
         for device in &components {
             if !controller {
-                summary.rows.push(Row::info(format!("component-{}", device.port), component_name(device), if device.product_id == 0x007e { "Charging dock connected · charging status comes from the mouse, not dock USB presence" } else { "Connected component · actual configuration capabilities queried separately" }));
-            }
-            let detail = device.group();
-            if controller {
-                if let Some(driver) = detail.rows.iter().find(|row| row.id == "drivers") {
-                    summary.rows.push(Row::info(
-                        "driver",
-                        "Current kernel driver",
-                        &driver.subtitle,
-                    ));
-                }
-                let schedules: BTreeSet<&str> = detail
-                    .rows
-                    .iter()
-                    .filter(|row| row.id.contains("-ep-"))
-                    .filter_map(|row| row.subtitle.split(';').next())
-                    .collect();
                 summary.rows.push(Row::info(
-                    "usb-schedule",
-                    "USB interrupt scheduling",
-                    if schedules.is_empty() {
-                        "No readable interrupt-IN schedule · not a physical polling measurement"
-                            .into()
-                    } else {
-                        format!(
-                            "{} · scheduling opportunities, not measured reports",
-                            schedules.into_iter().collect::<Vec<_>>().join("; ")
-                        )
-                    },
+                    format!("component-{}", device.port),
+                    component_name(device),
+                    format!(
+                        "Connected on USB {} · {}",
+                        device.port,
+                        component_connection(device)
+                    ),
                 ));
             }
+            let detail = device.group();
             diagnostics.push(detail.id.clone());
             groups.push(detail);
             let mut summaries = Vec::new();
@@ -256,42 +284,118 @@ pub fn assemble(
                 groups.push(result.collapsed());
             }
             let mut live_inputs = None;
-            let mut measurement = None;
             let mut input_error = false;
+            let mut tools = controller.then(|| Group::new(format!("controller-tools:{}", device.id), "Controller checks", "Run a timed input analysis while moving both sticks. Results appear below after completion; no controller settings are changed."));
+            let primary_input = if controller {
+                input::primary_node(device)?
+            } else {
+                None
+            };
             for node in input::nodes(device)? {
-                let sample = input::snapshot(&node, controller, device.product_id == 0x0a3f);
-                if live_inputs.is_none() && sample.inputs.is_some() {
+                let sample = input::snapshot(&node, controller, device.has_rear_buttons());
+                let primary_node = primary_input
+                    .as_ref()
+                    .is_some_and(|primary| primary.id == node.id);
+                if primary_node && let Some(tools) = tools.as_mut() {
                     live_inputs = sample.inputs;
-                    measurement = Some(input::measurement_row(&node));
+                    input_error = sample.error.is_some();
+                    tools.rows.push(input::measurement_row(&node));
+                    if let Some(row) = input::rumble_row(&node) {
+                        tools.rows.push(row);
+                    } else {
+                        tools.rows.push(Row::info("rumble-support", "Rumble test unavailable in this input mode", "The selected gamepad does not advertise Linux force feedback. No nonfunctional evdev test or guessed native playback packet is offered; native haptic scaling details remain in Diagnostics."));
+                    }
                 }
-                input_error |= sample.error.is_some();
                 diagnostics.push(sample.group.id.clone());
                 groups.push(sample.group.collapsed());
-                if let Some((result, recorded)) = cache::load("measurement", &node.id) {
-                    summaries.extend(recorded);
-                    diagnostics.push(result.id.clone());
-                    groups.push(result.collapsed());
+                if let Some((mut result, recorded)) = cache::load("measurement", &node.id) {
+                    if controller
+                        && primary_node
+                        && result
+                            .rows
+                            .iter()
+                            .any(|row| row.id == "left-stick-analysis")
+                    {
+                        result.collapsed = false;
+                        settings.entry("tools").or_default().push(result.id.clone());
+                    } else {
+                        diagnostics.push(result.id.clone());
+                        result.collapsed = true;
+                        if !controller {
+                            summaries.extend(recorded);
+                        }
+                    }
+                    groups.push(result);
                 }
             }
-            summary.rows.extend(summaries);
-            if controller {
+            if let Some(mut tools) = tools {
                 let status = if live_inputs.is_some() {
-                    "Kernel input available · sampled every 500 ms"
+                    "Live input ready"
                 } else if input_error {
-                    "Input unavailable · see Diagnostics for permissions/removal"
+                    "Input access required"
                 } else {
-                    "USB present · controller input unreadable"
+                    "Waiting for controller"
                 };
-                let mut diagram = device.controller_group(live_inputs, status);
-                if let Some(row) = measurement {
-                    diagram.rows.push(row);
-                }
+                let diagram = device.controller_group(live_inputs, status);
                 settings
                     .entry("overview")
                     .or_default()
                     .push(diagram.id.clone());
                 groups.push(diagram);
+                if let Some(row) = device.recovery_row() {
+                    tools.rows.push(row);
+                }
+                tools.rows.extend(summaries);
+                settings
+                    .entry("tools")
+                    .or_default()
+                    .insert(0, tools.id.clone());
+                groups.push(tools);
                 battery = kernel_battery(device);
+                if device.product_id == 0x0a79 {
+                    match crate::wolverine::snapshot(device) {
+                        Ok(snapshot) => {
+                            for (section, group) in snapshot.groups {
+                                if section == "diagnostics" {
+                                    diagnostics.push(group.id.clone());
+                                } else {
+                                    settings.entry(section).or_default().push(group.id.clone());
+                                }
+                                groups.push(group);
+                            }
+                            if snapshot.battery.is_some() {
+                                battery = snapshot.battery;
+                            }
+                        }
+                        Err(error) => {
+                            for (section, title) in [
+                                ("sensitivity", "Native polling rate unavailable"),
+                                ("controls", "Native onboard mapping unavailable"),
+                                ("macros", "Native keyboard shortcuts unavailable"),
+                                ("firmware", "Installed firmware unavailable"),
+                                ("power", "Native battery unavailable"),
+                            ] {
+                                let mut unavailable = Group::new(
+                                    format!("{}:native-{section}-error", device.id),
+                                    title,
+                                    "Wolverine V4 Pro PC HID read failed; no settings were changed",
+                                );
+                                unavailable.rows.push(Row::info(
+                                    "read-error",
+                                    "Native HID access required",
+                                    format!("{error:#}. Ensure your user has read/write access to the controller's vendor HID interface, reload the installed udev permissions and reconnect the controller if needed. Keep Function + Menu + Y PC HID mode enabled, then refresh. No default values are substituted."),
+                                ));
+                                settings
+                                    .entry(section)
+                                    .or_default()
+                                    .push(unavailable.id.clone());
+                                groups.push(unavailable);
+                            }
+                        }
+                    }
+                }
+            } else {
+                summary.rows.extend(summaries);
             }
             for (index, snapshot) in daemon.devices.iter().enumerate() {
                 if claimed_daemon.contains(&index)
@@ -300,8 +404,50 @@ pub fn assemble(
                     continue;
                 }
                 claimed_daemon.insert(index);
-                if mouse && matches!(device.product_id, 0x0086 | 0x0088) && battery.is_none() {
+                if !controller
+                    && device.id == primary.id
+                    && let Some(dname) = snapshot.device_name()
+                    && !basilisk
+                    && device.product_id != 0x007e
+                {
+                    display_name = dname.strip_prefix("Razer ").unwrap_or(dname).to_owned();
+                }
+                if !controller
+                    && device.id == primary.id
+                    && !basilisk
+                    && let Some(dtype) = snapshot.device_type()
+                {
+                    let mapped = map_daemon_kind(dtype, device.product_id, &display_name);
+                    if mapped != "peripheral" {
+                        kind = mapped;
+                    }
+                }
+                if battery.is_none() && device.product_id != 0x007e {
                     battery = snapshot.battery();
+                }
+                if let Some(fw) = snapshot.firmware_version() {
+                    let fw_text = match snapshot.driver_version() {
+                        Some(driver) => format!("{fw} · OpenRazer getFirmware · driver {driver}"),
+                        None => format!("{fw} · OpenRazer getFirmware; driver version unavailable"),
+                    };
+                    summary.rows.push(Row::info(
+                        format!("firmware-{}", device.port),
+                        format!("{} · Firmware", component_name(device)),
+                        fw_text,
+                    ));
+                } else {
+                    summary.rows.push(Row::info(
+                        format!("firmware-{}", device.port),
+                        format!("{} · Firmware", component_name(device)),
+                        "Installed firmware unavailable from OpenRazer. A sleeping/unread value is not a version; USB bcdDevice is not firmware.",
+                    ));
+                }
+                if let Some(layout) = snapshot.keyboard_layout() {
+                    summary.rows.push(Row::info(
+                        format!("layout-{}", device.port),
+                        "Keyboard layout",
+                        layout,
+                    ));
                 }
                 for (section, group) in openrazer::product_groups(snapshot, component_name(device))
                 {
@@ -311,6 +457,8 @@ pub fn assemble(
                 diagnostics.push(snapshot.diagnostics.id.clone());
             }
         }
+        let mouse = kind == "mouse";
+        let dock = kind == "dock";
         if battery.is_none() && (mouse || controller) {
             let mut status = Group::new(
                 format!("{id}:battery-diagnostics"),
@@ -318,25 +466,27 @@ pub fn assemble(
                 "Only actual device battery APIs are used",
             )
             .collapsed();
-            status.rows.push(Row::info("source", "No percentage source available", if controller { "No battery power_supply with a real capacity attribute belongs to this physical USB device. xpad input and receiver presence do not provide battery percentage. A compatible verified GIP battery driver is required." } else { "OpenRazer getBattery is unavailable or returned its unknown sentinel; receiver/dock presence and USB descriptor revision are not battery readings." }));
+            status.rows.push(Row::info("source", "No percentage source available", if primary.product_id == 0x0a79 { "Neither the native PC HID battery getter nor a matching kernel power_supply provided a real percentage. See Power for native read status; no percentage is inferred from the USB connection." } else if controller { "No battery power_supply with a real capacity attribute belongs to this physical USB device. xpad input and receiver presence do not provide battery percentage. A compatible verified GIP battery driver is required." } else { "OpenRazer getBattery is unavailable or returned its unknown sentinel; receiver/dock presence and USB descriptor revision are not battery readings." }));
             diagnostics.push(status.id.clone());
             groups.push(status);
         }
-        if mouse || controller {
+        if matches!(kind, "mouse" | "controller" | "keyboard" | "keypad") {
             let mapping = remapper::group(&id, &components, controller);
-            settings
-                .entry("buttons")
-                .or_default()
-                .push(mapping.id.clone());
-            groups.push(mapping);
+            if !mapping.rows.is_empty() {
+                settings
+                    .entry(if controller { "macros" } else { "buttons" })
+                    .or_default()
+                    .push(mapping.id.clone());
+                groups.push(mapping);
+            }
         }
         if mouse && !settings.contains_key("sensitivity") {
             let mut unavailable = Group::new(
                 format!("{id}:capabilities"),
-                "Mouse controls",
-                "Device configuration requires the actual OpenRazer daemon object",
+                "Mouse sensitivity",
+                "Sensitivity configuration requires a readable supported OpenRazer API",
             );
-            unavailable.rows.push(Row::info("missing", "DPI, lighting & power controls unavailable", "The mouse remains usable with its current native input setup. No unsupported/default write controls are fabricated. Setup status is shown once below."));
+            unavailable.rows.push(Row::info("missing", "DPI and polling controls unavailable", "The mouse remains usable with its current native input setup. Other exported lighting and power controls remain available in their own sections; no unsupported/default sensitivity controls are fabricated."));
             settings
                 .entry("sensitivity")
                 .or_default()
@@ -346,16 +496,17 @@ pub fn assemble(
                 settings.entry("overview").or_default().push(setup.clone());
             }
         }
-        if !settings.contains_key("lighting") {
-            let mut lighting = Group::new(
-                format!("{id}:lighting-status"),
-                "Lighting capability",
-                "No guessed proprietary USB commands",
-            );
-            lighting.rows.push(Row::info("status", if controller { "RGB requires the vendor app" } else { "Lighting API unavailable" }, if controller { "This controller supports brightness/effect/color in Razer Controller Setup for Xbox on Windows/Xbox. The wireless receiver control envelope is not established for Linux; xpad/OpenRazer cannot configure it. Controller RGB does not sync with PC Chroma. No false color picker." } else if mouse || dock { "The physical component is connected, but no usable OpenRazer lighting controls were returned. Follow the Mouse controls setup status; no color/effect guesses or unsupported USB writes." } else { "No supported lighting API has been established for this connected product. USB identification alone does not prove writable RGB support." }));
-            if primary.product_id == 0x0a3f {
-                lighting.rows.push(Row::info("vendor", "Official controller setup & lighting instructions", "Razer's verified FAQ for the original Wolverine V3 Pro.").controlled(json!({"kind":"button","label":"Open official setup instructions","action":"controller-support","args":{"device":primary.id},"destructive":false})));
-            }
+        if !controller && !settings.contains_key("lighting") {
+            let mut lighting = Group::new(format!("{id}:lighting-status"), "Lighting", "");
+            lighting.rows.push(Row::info(
+                "status",
+                "Lighting controls unavailable",
+                if mouse || dock {
+                    "Ensure openrazer-daemon is running for Chroma lighting controls."
+                } else {
+                    "No OpenRazer lighting interface is exported for this device."
+                },
+            ));
             settings
                 .entry("lighting")
                 .or_default()
@@ -365,31 +516,30 @@ pub fn assemble(
             }
             groups.push(lighting);
         }
-        if controller {
-            let mut audio = Group::new(
-                format!("{id}:audio"),
-                "Headset audio",
-                "Controller 3.5 mm output is separate from standard gamepad input",
-            );
-            audio.rows.push(Row::info("status", "Headset output unavailable through xpad", "The original receiver exposes vendor-class GIP audio interfaces, not standard USB Audio. xpad registers input but no ALSA headset. A compatible verified GIP audio driver/protocol is required; this plugin does not detach the working input driver. Hardware volume: hold Audio Configuration + D-pad Up/Down."));
-            settings.entry("audio").or_default().push(audio.id.clone());
-            groups.push(audio);
+        if !controller && summary.title != display_name {
+            summary.title = display_name.clone();
         }
-        let summary_id = summary.id.clone();
-        groups.push(summary);
-        let mut overview = settings.remove("overview").unwrap_or_default();
-        if controller {
-            overview.push(summary_id);
-        } else {
-            overview.insert(0, summary_id);
+        if !summary.rows.is_empty() {
+            let summary_id = summary.id.clone();
+            groups.push(summary);
+            let overview = settings.entry("overview").or_default();
+            if controller {
+                overview.push(summary_id);
+            } else {
+                overview.insert(0, summary_id);
+            }
         }
+        let overview = settings.remove("overview").unwrap_or_default();
         let mut sections = vec![section("overview", "Overview", overview)];
         for (section_id, title) in [
+            ("controls", "Buttons"),
+            ("macros", "Keys & Macros"),
             ("sensitivity", "Sensitivity"),
             ("lighting", "Lighting"),
             ("power", "Power"),
-            ("buttons", "Buttons & macros"),
-            ("audio", "Headset audio"),
+            ("buttons", "Buttons & Macros"),
+            ("tools", "Tools"),
+            ("firmware", "Firmware"),
         ] {
             if let Some(ids) = settings.remove(section_id) {
                 sections.push(section(section_id, title, ids));
@@ -398,25 +548,9 @@ pub fn assemble(
         sections.push(section("diagnostics", "Diagnostics", diagnostics));
         products.push(Product {
             id,
-            name: name.into(),
-            kind: if mouse {
-                "mouse"
-            } else if controller {
-                "controller"
-            } else if dock {
-                "dock"
-            } else {
-                "peripheral"
-            }
-            .into(),
-            description: if mouse {
-                "Mouse, wireless receiver and connected charging dock"
-            } else if controller {
-                "Live inputs, connection status and firmware tools"
-            } else {
-                "Physical USB product · verified API capabilities only"
-            }
-            .into(),
+            name: display_name,
+            kind: kind.into(),
+            description: kind_description(kind, basilisk).into(),
             status: "USB connected".into(),
             connection: connection.into(),
             battery,
@@ -462,11 +596,13 @@ pub fn assemble(
 
 pub async fn controller_support(args: &Value) -> Result<()> {
     let device = usb::find(crate::string_arg(args, "device")?)?;
-    if device.product_id != 0x0a3f {
-        anyhow::bail!(
-            "These verified support instructions apply only to the original Wolverine V3 Pro"
-        );
-    }
+    let url = match device.product_id {
+        0x0a3f => "https://mysupport.razer.com/app/answers/detail/a_id/14587",
+        0x0a76 | 0x0a78 | 0x0a79 => crate::firmware::V4_VENDOR_PAGE,
+        _ => anyhow::bail!(
+            "These verified support instructions apply only to Wolverine V3 Pro (0a3f) and Wolverine V4 Pro (0a76/0a78/0a79)"
+        ),
+    };
     let connection = zbus::Connection::session().await?;
     let options: BTreeMap<&str, zbus::zvariant::Value<'_>> = BTreeMap::new();
     let reply = tokio::time::timeout(
@@ -476,11 +612,7 @@ pub async fn controller_support(args: &Value) -> Result<()> {
             "/org/freedesktop/portal/desktop",
             Some("org.freedesktop.portal.OpenURI"),
             "OpenURI",
-            &(
-                "",
-                "https://mysupport.razer.com/app/answers/detail/a_id/14587",
-                options,
-            ),
+            &("", url, options),
         ),
     )
     .await??;
@@ -508,13 +640,15 @@ mod tests {
             device(0x007e, "1-2"),
             device(0x0086, "1-3"),
             device(0x0a3f, "1-4"),
+            device(0x0a76, "1-8"),
             device(0x1234, "1-5"),
         ];
         let sets = product_sets(&devices);
-        assert_eq!(sets.len(), 3);
+        assert_eq!(sets.len(), 4);
         assert_eq!(sets[0].0, "basilisk-ultimate");
         assert_eq!(sets[0].1, vec![0, 2, 1]);
         assert!(sets.iter().any(|(id, _)| id == "wolverine-1-4"));
+        assert!(sets.iter().any(|(id, _)| id == "wolverine-1-8"));
         assert!(sets.iter().any(|(id, _)| id == "peripheral-1-5"));
         let ambiguous = vec![
             device(0x0088, "1-1"),
@@ -522,5 +656,33 @@ mod tests {
             device(0x007e, "1-3"),
         ];
         assert_eq!(product_sets(&ambiguous).len(), 3);
+    }
+
+    #[test]
+    fn wolverine_v4_and_openrazer_categories_resolve_rich_product_kinds() {
+        let v4 = device(0x0a76, "1-8");
+        assert!(v4.is_controller());
+        assert!(v4.is_wolverine_v4());
+        assert!(v4.has_rear_buttons());
+        assert_eq!(v4.controller_display_name(), "Wolverine V4 Pro");
+        assert_eq!(v4.inferred_kind(), "controller");
+        let v4_pc = device(0x0a78, "1-8");
+        assert!(v4_pc.is_controller());
+        assert_eq!(
+            v4_pc.controller_display_name(),
+            "Wolverine V4 Pro (PC XInput)"
+        );
+        let v4_hid = device(0x0a79, "1-8");
+        assert!(v4_hid.is_wolverine_v4());
+        assert_eq!(
+            v4_hid.controller_display_name(),
+            "Wolverine V4 Pro (PC HID)"
+        );
+        assert_eq!(device(0x025a, "1-2").inferred_kind(), "keyboard");
+        assert_eq!(device(0x0244, "1-3").inferred_kind(), "keypad");
+        assert_eq!(device(0x0527, "1-4").inferred_kind(), "headset");
+        assert_eq!(device(0x0c04, "1-5").inferred_kind(), "mousemat");
+        assert_eq!(device(0x0f08, "1-6").inferred_kind(), "accessory");
+        assert_eq!(device(0x00a4, "1-7").inferred_kind(), "dock");
     }
 }

@@ -2,8 +2,9 @@ use crate::{ControllerInput, Group, Row, Visualization};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::fs;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-
 #[derive(Debug)]
 pub struct Device {
     pub id: String,
@@ -79,48 +80,166 @@ fn interval_us(speed: f64, interval: u16) -> Option<u64> {
 }
 impl Device {
     pub fn is_controller(&self) -> bool {
-        matches!(self.product_id, 0x0a3f | 0x0a57 | 0x0a59)
+        matches!(
+            self.product_id,
+            0x0a00
+                | 0x0a03
+                | 0x0a14
+                | 0x0a15
+                | 0x0a29
+                | 0x0a3f
+                | 0x0a57
+                | 0x0a59
+                | 0x0a76
+                | 0x0a77
+                | 0x0a78
+                | 0x0a79
+        ) || self.has_xpad_interface()
+    }
+
+    pub fn is_wolverine_v4(&self) -> bool {
+        matches!(self.product_id, 0x0a76 | 0x0a78 | 0x0a79)
+    }
+
+    pub fn has_rear_buttons(&self) -> bool {
+        matches!(self.product_id, 0x0a3f | 0x0a57 | 0x0a59 | 0x0a76..=0x0a79)
+            || self.name.contains("Wolverine")
+    }
+
+    fn has_xpad_interface(&self) -> bool {
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().contains(':') {
+                continue;
+            }
+            let iface = entry.path();
+            if let Ok(target) = fs::read_link(iface.join("driver"))
+                && target.file_name().is_some_and(|name| name == "xpad")
+            {
+                return true;
+            }
+            let class = hex(iface.join("bInterfaceClass"));
+            let subclass = hex(iface.join("bInterfaceSubClass"));
+            let protocol = hex(iface.join("bInterfaceProtocol"));
+            if class == Some(0xff)
+                && ((subclass == Some(0x47) && protocol == Some(0xd0))
+                    || (subclass == Some(0x5d) && matches!(protocol, Some(0x01 | 0x81))))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn inferred_kind(&self) -> &'static str {
+        if self.is_controller() {
+            return "controller";
+        }
+        if matches!(self.product_id, 0x007e | 0x00a4 | 0x0f21) || self.name.contains("Dock") {
+            return "dock";
+        }
+        if matches!(self.product_id, 0x0068 | 0x0c00..=0x0c0f)
+            || self.name.contains("Firefly")
+            || self.name.contains("Goliathus")
+            || self.name.contains("Strider")
+        {
+            return "mousemat";
+        }
+        if (0x0001..=0x00ff).contains(&self.product_id) {
+            return "mouse";
+        }
+        if matches!(
+            self.product_id,
+            0x0111 | 0x0201 | 0x0207 | 0x0208 | 0x0214 | 0x022b | 0x0244
+        ) || self.name.contains("Tartarus")
+            || self.name.contains("Orbweaver")
+            || self.name.contains("Nostromo")
+        {
+            return "keypad";
+        }
+        if (0x0100..=0x02ff).contains(&self.product_id) || self.product_id == 0x0a24 {
+            return "keyboard";
+        }
+        if (0x0500..=0x05ff).contains(&self.product_id)
+            || self.product_id == 0x0f19
+            || self.name.contains("Kraken")
+            || self.name.contains("BlackShark")
+            || self.name.contains("Barracuda")
+        {
+            return "headset";
+        }
+        if (0x0f00..=0x0fff).contains(&self.product_id) {
+            return "accessory";
+        }
+        "peripheral"
+    }
+
+    pub fn controller_display_name(&self) -> &str {
+        match self.product_id {
+            0x0a3f => "Wolverine V3 Pro",
+            0x0a57 | 0x0a59 => "Wolverine V3 Pro 8K PC",
+            0x0a76 => "Wolverine V4 Pro",
+            0x0a78 => "Wolverine V4 Pro (PC XInput)",
+            0x0a79 => "Wolverine V4 Pro (PC HID)",
+            _ => self
+                .name
+                .strip_prefix("Razer ")
+                .unwrap_or(self.name.as_str()),
+        }
+    }
+
+    pub fn controller_connection_label(&self) -> &'static str {
+        match self.product_id {
+            0x0a3f | 0x0a59 => "2.4 GHz USB receiver",
+            0x0a57 => "Wired USB",
+            0x0a76 => "2.4 GHz receiver / USB (Xbox 250 Hz mode)",
+            0x0a78 => "High-Speed USB (PC XInput)",
+            0x0a79 => "High-Speed USB (PC HID)",
+            _ if self.speed >= 480.0 => "High-Speed USB",
+            _ => "USB connected",
+        }
+    }
+
+    pub fn devnode(&self) -> Option<PathBuf> {
+        let bus: u16 = text(self.path.join("busnum"))?.parse().ok()?;
+        let dev: u16 = text(self.path.join("devnum"))?.parse().ok()?;
+        Some(PathBuf::from(format!("/dev/bus/usb/{bus:03}/{dev:03}")))
     }
 
     pub fn controller_group(&self, inputs: Option<Vec<ControllerInput>>, status: &str) -> Group {
-        let name = match self.product_id {
-            0x0a3f => "Wolverine V3 Pro",
-            0x0a57 | 0x0a59 => "Wolverine V3 Pro 8K PC",
-            _ => &self.name,
-        };
-        let connection = match self.product_id {
-            0x0a3f | 0x0a59 => "2.4 GHz USB receiver",
-            0x0a57 => "Wired USB",
-            _ => "USB connected · transport undetermined",
-        };
+        let can_stream = inputs.is_some();
         let mut group = Group::new(
             format!("controller:{}", self.id),
-            "Live controller input",
-            "Select a button or stick to inspect its standard output",
+            "Live controller",
+            "Live input is read independently of device settings; hardware-mapped extra buttons are not invented as independent gamepad inputs.",
         );
-        if self.product_id == 0x0a3f || inputs.is_some() {
+        if self.has_rear_buttons() || inputs.is_some() {
             group.visualization = Some(Visualization::Controller {
-                name: name.into(),
-                connection: connection.into(),
+                name: self.controller_display_name().into(),
+                connection: self.controller_connection_label().into(),
                 status: status.into(),
                 inputs: inputs.unwrap_or_else(crate::input::unknown_controller_inputs),
+                stream: can_stream.then(|| json!({"args":["--input-stream",self.id]})),
             });
         }
-        group.rows.push(Row::info("polling", "Physical polling", if self.product_id == 0x0a3f {
-            "Up to 250 Hz wireless · 1000 Hz wired PC Tournament Mode (Function + Menu + A). The live view samples every 500 ms."
-        } else {
-            "Physical polling limits are not inferred from USB identity. The live view samples every 500 ms; measure changed-input cadence below."
-        }));
-        if self.product_id == 0x0a3f {
-            group.rows.push(Row::info("firmware-check", "Firmware · official Windows updater", "Installed firmware is unreadable here. Check the offered updater; no comparison or Linux flash.").controlled(json!({"kind":"button","label":"Check vendor updater","action":"firmware-check","args":{"device":self.id},"destructive":false})));
-            group.rows.push(Row::info("vendor-page", "Windows firmware instructions", "Follow the official controller/dongle updater prompts on a Windows PC.").controlled(json!({"kind":"button","label":"Open official support page","action":"vendor-page","args":{"device":self.id},"destructive":false})));
-        } else {
-            group.rows.push(Row::info("firmware", "Firmware · vendor model required", "Installed proprietary firmware is not readable via xpad/evdev. The verified original 0a3f updater is not offered for this different USB identity."));
-        }
-        group.rows.push(Row::info("capabilities", "Available here", "Live standard inputs and explicit cadence measurement. See Lighting, Buttons & macros and Headset audio for configuration boundaries; raw records stay in Diagnostics."));
         group
     }
 
+    pub fn recovery_row(&self) -> Option<Row> {
+        if !matches!(self.product_id, 0x0a3f | 0x0a59 | 0x0a76) {
+            return None;
+        }
+        let node = self.devnode()?;
+        let _access = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(node)
+            .ok()?;
+        Some(Row::info("usb-reset", "Reset an unresponsive receiver", "Use only if input is stuck. This disconnects all controller interfaces; it does not prove wireless recovery. Offered only for receiver modes with USB write access.").controlled(json!({"kind":"button","label":"Reset USB receiver","action":"usb-reset","args":{"device":self.id},"destructive":true})))
+    }
     pub fn group(&self) -> Group {
         let mut group = Group::new(
             &self.id,
@@ -204,17 +323,19 @@ impl Device {
             },
         ));
         group.rows.push(Row::info("runtime-power", "USB runtime power", format!("power/control={}; runtime_status={}. Observed sysfs power management only; no power setting is changed.", text(self.path.join("power/control")).unwrap_or_else(|| "unavailable".into()), text(self.path.join("power/runtime_status")).unwrap_or_else(|| "unavailable".into()))));
-        if matches!(self.product_id, 0x0a3f | 0x0a57 | 0x0a59) {
-            group.rows.push(Row::info("controller-state", "Controller proprietary configuration", "Unavailable through standard xpad/evdev: onboard profiles, independent paddle assignments, physical trigger-lock positions, proprietary battery/configuration and firmware. Mapped button/axis effects are observable below; no guessed USB packets, grabs, driver changes or firmware comparisons are performed."));
-            group.rows.push(Row::info("controller-limits", "Physical polling limits", if self.product_id == 0x0a3f {
-                "Original Wolverine V3 Pro: vendor documents up to 250 Hz wireless and 1000 Hz wired PC Tournament Mode (Function + Menu + A). A 4 ms wireless USB endpoint does not become 1000 Hz via a Linux interval override. The 8K PC model is different hardware."
-            } else {
-                "1532:0a57 wired and 0a59 wireless are Wolverine V3 Pro 8K PC identities documented in OpenRazer issue #2569 and upstream xpad support. They are distinct from original 0a3f; advertised physical polling is not inferred from endpoint scheduling or UI sampling."
+        if self.is_controller() {
+            group.rows.push(Row::info("controller-state", "Controller proprietary configuration", if self.product_id == 0x0a79 { "Native PC HID polling, onboard button mapping and battery getters are queried in their settings sections. Standard evdev reports only observable mapped button/axis effects; physical trigger locks and installed firmware are not inferred. Reading state does not change onboard settings." } else { "Unavailable through standard xpad/evdev: onboard profiles, independent paddle assignments, physical trigger-lock positions, proprietary battery/configuration and firmware. Mapped button/axis effects are observable below; no guessed USB packets, grabs, driver changes or firmware comparisons are performed." }));
+            group.rows.push(Row::info("controller-limits", "Physical polling limits", match self.product_id {
+                0x0a3f => "Original Wolverine V3 Pro: vendor documents up to 250 Hz wireless and 1000 Hz wired PC Tournament Mode (Function + Menu + A). A 4 ms wireless USB endpoint does not become 1000 Hz via a Linux interval override. The 8K PC model is different hardware.",
+                0x0a76 | 0x0a78 | 0x0a79 => "Wolverine V4 Pro (RZ06-0606): Xbox (1532:0a76), PC XInput (1532:0a78) and PC HID (1532:0a79) are distinct USB personalities. Advertised PC support is up to 8000 Hz; only a successful native getter reports the current onboard polling setting, not endpoint scheduling or USB speed.",
+                _ => "1532:0a57 wired and 0a59 wireless are Wolverine V3 Pro 8K PC identities documented in OpenRazer issue #2569 and upstream xpad support. Advertised physical polling is not inferred from endpoint scheduling or UI sampling.",
             }));
         }
         if self.product_id == 0x0a3f {
             group.rows.push(Row::info("firmware-check", "Original Wolverine vendor updater", "Check the official download redirect for the currently offered Windows updater. Installed firmware is unavailable; no newer-than-installed claim is possible.").controlled(json!({"kind":"button","label":"Check vendor updater","action":"firmware-check","args":{"device":self.id},"destructive":false})));
             group.rows.push(Row::info("vendor-page", "Official Windows firmware instructions", crate::firmware::VENDOR_PAGE).controlled(json!({"kind":"button","label":"Open official support page","action":"vendor-page","args":{"device":self.id},"destructive":false})));
+        } else if self.is_wolverine_v4() {
+            group.rows.push(Row::info("vendor-page", "Official Wolverine V4 Pro page", crate::firmware::V4_VENDOR_PAGE).controlled(json!({"kind":"button","label":"Open official product page","action":"vendor-page","args":{"device":self.id},"destructive":false})));
         }
         group
     }
@@ -228,6 +349,63 @@ pub fn require_original(id: &str) -> Result<Device> {
         );
     }
     Ok(device)
+}
+
+pub fn reset_device(id: &str) -> Result<Group> {
+    let device = find(id)?;
+    if !device.is_controller() {
+        bail!("USB receiver re-initialization is restricted to connected controller devices");
+    }
+    let devnode = device
+        .devnode()
+        .context("USB bus/device numbers unavailable in sysfs")?;
+    // USBDEVFS_RESET = _IO('U', 20) = 0x5514
+    const USBDEVFS_RESET: libc::c_ulong = 0x5514;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(&devnode)
+        .or_else(|_| {
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC)
+                .open(&devnode)
+        })
+        .with_context(|| {
+            format!(
+                "Opening {} for USB reset: grant uaccess on 1532:{:04x} via udev (e.g. SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"1532\", ATTR{{idProduct}}==\"{:04x}\", TAG+=\"uaccess\") or unplug and replug the receiver once",
+                devnode.display(),
+                device.product_id,
+                device.product_id
+            )
+        })?;
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_RESET, 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "USBDEVFS_RESET on {} failed: ensure your user has write/uaccess permission on the USB device node",
+                devnode.display()
+            )
+        });
+    }
+    // Give the kernel a brief moment to re-bind xpad and recreate /dev/input/event*
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let mut group = Group::new(
+        format!("usb-reset:{}", device.id),
+        format!("USB receiver re-initialized · {}", device.name),
+        "USBDEVFS_RESET completed; verify controller input after the kernel reset",
+    );
+    group.rows.push(Row::info(
+        "status",
+        "USB port reset succeeded",
+        format!(
+            "Reset {} ({}) at {}. A successful USB reset does not establish that the wireless link or input streaming recovered.",
+            device.name,
+            devnode.display(),
+            device.port
+        ),
+    ));
+    Ok(group)
 }
 
 #[cfg(test)]

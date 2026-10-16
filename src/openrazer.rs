@@ -2,7 +2,7 @@ use crate::{Group, Row, string_arg};
 #[path = "openrazer_controls.rs"]
 mod controls;
 use anyhow::{Context, Result, bail};
-pub use controls::{configure, dpi_presets, product_groups};
+pub use controls::{battery_notifications, configure, dpi_presets, product_groups};
 use futures_util::{StreamExt, stream};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
@@ -43,6 +43,7 @@ impl Method {
         // Pairing, reset, macros, game mode/key suppression and unknown operations do not.
         !(self.interface.starts_with("razer.device.lighting.")
             || self.interface == "razer.device.dpi"
+            || self.interface == "razer.device.scroll"
             || matches!(
                 self.name.as_str(),
                 "setPollRate" | "setIdleTime" | "setLowBatteryThreshold"
@@ -85,13 +86,54 @@ impl DeviceSnapshot {
         if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
             return None;
         }
+        let charging = self
+            .value("razer.device.power", "isCharging")
+            .and_then(Json::as_bool);
+        if percentage == 0.0
+            && charging == Some(false)
+            && self
+                .value("razer.device.misc", "getFirmware")
+                .and_then(Json::as_str)
+                .is_some_and(|version| matches!(version.trim(), "v0.0" | "0.0"))
+        {
+            return None;
+        }
         Some(crate::Battery {
             percentage: Some(percentage),
-            charging: self
-                .value("razer.device.power", "isCharging")
-                .and_then(Json::as_bool),
+            charging,
             source: "OpenRazer getBattery / isCharging".into(),
         })
+    }
+
+    pub fn device_name(&self) -> Option<&str> {
+        self.value("razer.device.misc", "getDeviceName")
+            .and_then(Json::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn device_type(&self) -> Option<&str> {
+        self.value("razer.device.misc", "getDeviceType")
+            .and_then(Json::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn firmware_version(&self) -> Option<&str> {
+        self.value("razer.device.misc", "getFirmware")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|version| !version.is_empty() && !matches!(*version, "v0.0" | "0.0"))
+    }
+
+    pub fn driver_version(&self) -> Option<&str> {
+        self.value("razer.device.misc", "getDriverVersion")
+            .and_then(Json::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn keyboard_layout(&self) -> Option<&str> {
+        self.value("razer.device.misc", "getKeyboardLayout")
+            .and_then(Json::as_str)
+            .filter(|s| !s.is_empty() && *s != "unknown")
     }
 }
 
@@ -531,7 +573,7 @@ async fn device_snapshot(connection: &Connection, serial: &str) -> Result<Device
                 }
             }),
     )
-    .buffer_unordered(16);
+    .buffer_unordered(1);
     let values: BTreeMap<String, Result<Json, String>> = reads.collect().await;
     let name = values
         .get("razer.device.misc.getDeviceName")
@@ -656,7 +698,7 @@ pub async fn state() -> Snapshot {
         Err(error) => {
             let mut group = Group::new(
                 "openrazer",
-                "Mouse configuration setup",
+                "OpenRazer configuration setup",
                 "Native USB and controller input remain available",
             );
             group.rows.push(Row::info("daemon", "OpenRazer unavailable", format!("{error:#}. Install matching OpenRazer kernel modules and openrazer-daemon, follow its device permissions, then run the daemon in your desktop session. No automatic installation or hardware writes.")).controlled(json!({"kind":"button","label":"Open setup instructions","action":"openrazer-setup","args":{},"destructive":false})));
@@ -757,6 +799,30 @@ pub async fn action(args: &Json) -> Result<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unread_firmware_is_not_an_installed_version_or_empty_battery() {
+        let mut device = DeviceSnapshot {
+            serial: "serial".into(),
+            methods: Vec::new(),
+            values: BTreeMap::from([
+                ("razer.device.power.getBattery".into(), Ok(json!(0))),
+                ("razer.device.power.isCharging".into(), Ok(json!(false))),
+            ]),
+            diagnostics: Group::new("api", "API", ""),
+        };
+        for firmware in ["v0.0", "0.0", " v0.0 "] {
+            device
+                .values
+                .insert("razer.device.misc.getFirmware".into(), Ok(json!(firmware)));
+            assert!(device.firmware_version().is_none());
+            assert!(device.battery().is_none());
+        }
+        device
+            .values
+            .insert("razer.device.misc.getFirmware".into(), Ok(json!("v1.2")));
+        assert_eq!(device.firmware_version(), Some("v1.2"));
+        assert_eq!(device.battery().unwrap().percentage, Some(0.0));
+    }
     #[test]
     fn compound_values_and_numeric_boundaries() {
         let value = typed_value("a(qq)", &json!([[800, 800], [1600, 1600]])).unwrap();
