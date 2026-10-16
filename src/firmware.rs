@@ -7,6 +7,7 @@ use std::time::Duration;
 use zbus::{Connection, zvariant::OwnedValue};
 
 pub const VENDOR_PAGE: &str = "https://mysupport.razer.com/app/answers/detail/a_id/14630/~/razer-wolverine-v3-pro-firmware-updater-%7C-rz06-0520";
+pub const V4_VENDOR_PAGE: &str = "https://mysupport.razer.com/app/answers/detail/a_id/21268";
 const DOWNLOAD: &str = "https://rzr.to/b556gr";
 const FWUPD: &str = "org.freedesktop.fwupd";
 type Properties = HashMap<String, OwnedValue>;
@@ -63,7 +64,12 @@ pub async fn vendor_check(args: &Value) -> Result<Group> {
             }
         }))
         .build()?;
-    let response = client.head(DOWNLOAD).send().await.context("Official firmware check unavailable; last manually verified 2026-10-09 was updater v2.04.00_r1 (not a live latest-version result)")?.error_for_status()?;
+    let response = client
+        .head(DOWNLOAD)
+        .send()
+        .await
+        .context("Official firmware check unavailable; no live updater version was obtained")?
+        .error_for_status()?;
     let version = updater_version(response.url())?;
     let mut group = Group::new(
         format!("firmware-check:{id}"),
@@ -87,8 +93,18 @@ pub async fn vendor_check(args: &Value) -> Result<Group> {
     crate::cache::store("firmware", id, &group, &summary)?;
     Ok(group)
 }
+fn vendor_page(product_id: u16) -> Result<&'static str> {
+    match product_id {
+        0x0a3f => Ok(VENDOR_PAGE),
+        0x0a76 | 0x0a78 | 0x0a79 => Ok(V4_VENDOR_PAGE),
+        _ => bail!(
+            "Official vendor page is only configured for Wolverine V3 Pro (0a3f) and Wolverine V4 Pro (0a76/0a78/0a79)"
+        ),
+    }
+}
 pub async fn open_page(args: &Value) -> Result<()> {
-    usb::require_original(string_arg(args, "device")?)?;
+    let device = usb::find(string_arg(args, "device")?)?;
+    let url = vendor_page(device.product_id)?;
     // Portal receives the request over D-Bus, so no spawned opener can be killed
     // with the host's subprocess process group. Completion means portal acceptance.
     let connection = Connection::session().await?;
@@ -100,7 +116,7 @@ pub async fn open_page(args: &Value) -> Result<()> {
             "/org/freedesktop/portal/desktop",
             Some("org.freedesktop.portal.OpenURI"),
             "OpenURI",
-            &("", VENDOR_PAGE, options),
+            &("", url, options),
         ),
     )
     .await
@@ -227,6 +243,17 @@ pub async fn update(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn official_pages_are_scoped_to_physical_product_ids() {
+        assert_eq!(vendor_page(0x0a3f).unwrap(), VENDOR_PAGE);
+        for pid in [0x0a76, 0x0a78, 0x0a79] {
+            assert_eq!(vendor_page(pid).unwrap(), V4_VENDOR_PAGE);
+            assert_ne!(vendor_page(pid).unwrap(), VENDOR_PAGE);
+        }
+        for pid in [0x0088, 0x0a57, 0x0a59, 0x0a77, 0xffff] {
+            assert!(vendor_page(pid).is_err());
+        }
+    }
     #[test]
     fn redirect_identity_is_not_guessable() {
         let good = Url::parse("https://dl.razerzone.com/drivers/WolverineV3Pro/win/C883CEA1200064BDC0285A18CA39CDED/WolverineV3Pro_0A3F_FirmwareUpdater_v2.04.00_r1.exe").unwrap();

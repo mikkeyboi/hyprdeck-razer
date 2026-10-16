@@ -7,6 +7,11 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+// Embedded adapter uses the installed backend's discovery, schema/parser and
+// daemon API. It does not implement input injection or assume event-node order.
+const BACKEND: &str = include_str!("input_remapper.py");
+const INSTALL: &str = "Input Remapper v2 is optional software, not onboard memory. On Arch, review/build the AUR input-remapper-git package (https://aur.archlinux.org/packages/input-remapper-git). It requires its GTK editor, Python backend, system-bus service and input/uinput access. Hyprdeck never installs it, enables a service or changes autoload settings.";
+
 fn executable(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
@@ -18,164 +23,258 @@ fn executable(name: &str) -> Option<PathBuf> {
             })
     })
 }
-fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .map(|root| root.join("input-remapper-2"))
+
+fn python() -> Result<PathBuf> {
+    // Distribution-installed Input Remapper needs the system Python, not an
+    // activated virtualenv with a different set of packages.
+    let system = PathBuf::from("/usr/bin/python3");
+    if system.is_file() {
+        return Ok(system);
+    }
+    executable("python3").context("Python 3 is required by Input Remapper")
 }
-fn preset_dir(device: &usb::Device) -> Option<PathBuf> {
-    // Upstream groups interfaces by physical device and uses its shortest input name
-    // as the preset model folder. Actual CLI device selection uses an event path,
-    // never a guessed/remapper display name or an unrelated keyboard.
-    let nodes = input::nodes(device).ok()?;
-    let name = nodes
-        .iter()
-        .map(|node| node.name.as_str())
-        .min_by_key(|name| name.len())?;
-    let name: String = name
-        .chars()
-        .map(|character| {
-            if "/\\?%*:|\"<>".contains(character) {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect();
-    Some(config_dir()?.join("presets").join(name))
+
+fn decode(output: std::process::Output) -> Result<Value> {
+    let value: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Input Remapper backend returned no usable response: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        bail!("Input Remapper: {error}");
+    }
+    if !output.status.success() {
+        bail!(
+            "Input Remapper backend failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(value)
 }
-fn presets(device: &usb::Device) -> Vec<String> {
-    let Some(directory) = preset_dir(device) else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension()?.to_str()? != "json" {
-                return None;
-            }
-            let value: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
-            if !value.is_array() {
-                return None;
-            }
-            path.file_stem()?.to_str().map(str::to_owned)
-        })
-        .collect();
-    names.sort();
-    names
+
+fn discover(paths: &[String]) -> Result<Value> {
+    decode(
+        Command::new(python()?)
+            .args(["-I", "-c", BACKEND])
+            .arg(json!({"operation":"discover","paths":paths}).to_string())
+            .stdin(Stdio::null())
+            .output()
+            .context("Reading installed Input Remapper device groups and daemon state")?,
+    )
 }
+
+fn device_paths(device: &usb::Device) -> Result<Vec<String>> {
+    Ok(input::nodes(device)?
+        .into_iter()
+        .map(|node| node.path.to_string_lossy().into_owned())
+        .collect())
+}
+
+fn supports_remapping(device: &usb::Device) -> bool {
+    device.is_controller() || matches!(device.inferred_kind(), "mouse" | "keyboard" | "keypad")
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn backend_button(operation: &str, device: &usb::Device, key: &str, label: &str) -> Value {
+    json!({
+        "kind":"button", "label":label, "action":"input-remapper",
+        "args":{"operation":operation,"device":device.id,"group":key},
+        "destructive":false
+    })
+}
+
 pub fn group(id: &str, devices: &[&usb::Device], controller: bool) -> Group {
     let mut group = Group::new(
         format!("{id}:mapping"),
-        "Buttons & macros",
-        "Software remapping is separate from onboard Razer profiles",
-    );
-    group.rows.push(Row::info("onboard", "Onboard assignments unavailable", if controller { "xpad exposes mapped standard inputs, not independent rear-button assignments or onboard profile writes. Use Razer Controller Setup for Xbox on Windows/Xbox for device profiles. Razer's original Wolverine FAQ explicitly excludes onboard macros; software macros below are a separate optional tool." } else { "OpenRazer's Basilisk Ultimate METHODS list exposes DPI, lighting and power, but no button remapping or macros. Installing the daemon does not add those unsupported APIs." }));
-    let installed = executable("input-remapper-gtk").is_some();
-    let mut row = Row::info(
-        "editor",
-        if installed {
-            "Input Remapper · mapping & macro editor"
+        "Software macros",
+        if controller {
+            "For paddles, first assign distinct F13–F18 keys above, then choose their keyboard events as triggers. Software presets run on Linux, not in onboard memory."
         } else {
-            "Optional Linux mapping & macros setup"
+            "Input Remapper software presets run on Linux, not in onboard memory. Save here; choose the device and apply or stop in its editor."
         },
-        "Input Remapper supports Wayland/X11, button combinations and programmable macros via its privileged service and virtual input devices. Select this physical product in its editor, record the actual input, create/save a preset and Apply explicitly. It may grab/remap the device while active; unlike this plugin's read-only diagnostics. Stop in the editor to restore original input. Hidden mouse keyboard interfaces are part of the same product, not extra keyboards.",
     );
-    if installed {
-        row.control = Some(
-            json!({"kind":"button","label":"Edit mappings & macros","action":"input-remapper","args":{"operation":"editor"},"destructive":false}),
-        );
-    } else {
-        row.subtitle.push_str(" Install input-remapper (Arch: upstream AUR input-remapper-git) and follow its service/authorization setup. This plugin never auto-installs it.");
+    let gui = executable("input-remapper-gtk").is_some();
+    if executable("input-remapper-control").is_none() {
+        group.rows.push(Row::info(
+            "availability",
+            "Input Remapper backend is not installed",
+            INSTALL,
+        ));
+        return group;
     }
-    group.rows.push(row);
-    if executable("input-remapper-control").is_some() {
-        for device in devices {
-            if !device.is_controller() && !matches!(device.product_id, 0x0086 | 0x0088) {
-                continue;
-            }
-            let available = presets(device);
-            if available.is_empty() {
-                continue;
-            }
-            let mut options = vec![json!({"value":"","label":"Choose a saved preset"})];
-            options.extend(
-                available
-                    .into_iter()
-                    .map(|name| json!({"value":name,"label":name})),
-            );
-            group.rows.push(Row::info(format!("presets:{}", device.port), "Apply a saved software preset", "Existing Input Remapper v2 preset files for this physical device. Explicit application can alter/grab input; this is not an onboard profile. Service and input permissions are required.").controlled(json!({"kind":"form","fields":[{"id":"preset","label":"Saved mapping / macro preset","kind":"choice","value":"","options":options}],"action":"input-remapper","args":{"operation":"start","device":device.id},"label":"Apply preset"})));
-            group.rows.push(Row::info(format!("stop:{}", device.port), "Restore original software input", "Stops only this physical device's Input Remapper injection, not all system mappings.").controlled(json!({"kind":"button","label":"Stop software mapping","action":"input-remapper","args":{"operation":"stop","device":device.id},"destructive":false})));
+    if !gui {
+        group.rows.push(Row::info(
+            "gui-unavailable",
+            "Input Remapper GTK editor is missing",
+            "Complete the Input Remapper installation for recording combinations and editing full presets. The native form below can create a single-key/button programmable macro preset when backend discovery is available.",
+        ));
+    }
+    let mut product_paths = Vec::new();
+    for device in devices {
+        if !supports_remapping(device) {
+            continue;
         }
+        match device_paths(device) {
+            Ok(paths) => product_paths.push((*device, paths)),
+            Err(error) => group.rows.push(Row::info(
+                format!("nodes:{}", device.port),
+                "Physical input discovery unavailable",
+                error.to_string(),
+            )),
+        }
+    }
+    let paths: Vec<String> = product_paths
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect();
+    let discovered = match discover(&paths) {
+        Ok(value) => value,
+        Err(error) => {
+            group.rows.push(Row::info(
+                "discovery-error",
+                "Input Remapper backend unavailable",
+                format!("{error}. Check the distribution Python dependencies and input-node read permissions; no mapping was started. {INSTALL}"),
+            ));
+            return group;
+        }
+    };
+    let Some(backends) = discovered.get("groups").and_then(Value::as_array) else {
+        group.rows.push(Row::info("discovery-error", "Input Remapper discovery failed", "The installed backend did not return device groups. Check its version and dependencies."));
+        return group;
+    };
+    if backends.is_empty() {
+        group.rows.push(Row::info(
+            "no-backend-input",
+            "No readable Input Remapper group for this product",
+            "The installed backend did not discover the product's physical input nodes. Check input permissions and connection mode. A controller may expose duplicated controller assignments rather than independent paddle events; no unrelated keyboard or first event node will be selected as a fallback.",
+        ));
+    }
+    for backend in backends {
+        let backend_paths = backend.get("paths").and_then(Value::as_array);
+        let Some((device, _)) = product_paths.iter().find(|(_, paths)| {
+            backend_paths.is_some_and(|found| {
+                found.iter().any(|path| {
+                    path.as_str()
+                        .is_some_and(|path| paths.iter().any(|own| own == path))
+                })
+            })
+        }) else {
+            continue;
+        };
+        let key = text(backend, "key");
+        let row_id = format!("{}:{key}", device.port);
+        if gui {
+            group.rows.push(Row::info(
+                format!("editor:{row_id}"),
+                "Advanced keyboard & macro editor",
+                format!("Record combinations, edit presets, and apply or stop mappings. Select “{key}” yourself; administrator authentication may be required. Hyprdeck does not start/stop root injectors through ambiguous device-name keys."),
+            ).controlled(backend_button("editor", device, key, "Open Input Remapper editor")));
+        }
+        if let Some(options) = backend
+            .get("inputs")
+            .and_then(Value::as_array)
+            .filter(|options| !options.is_empty())
+        {
+            let mut choices =
+                vec![json!({"value":"","label":"Choose an advertised input key/button"})];
+            choices.extend(options.iter().cloned());
+            group.rows.push(Row::info(
+                format!("create:{row_id}"),
+                "Create a programmable macro",
+                "Choose an advertised trigger and write a macro, for example key(KEY_A).wait(100).key(KEY_B). The installed parser validates it. Save creates a new preset without applying or overwriting anything.",
+            ).controlled(json!({
+                "kind":"form", "label":"Save macro preset", "action":"input-remapper",
+                "args":{"operation":"save","device":device.id,"group":key},
+                "fields":[
+                    {"id":"name","label":"New preset name (no dots)","kind":"text","value":"Hyprdeck macro"},
+                    {"id":"input","label":"Trigger key / button (searchable)","kind":"choice","value":"","options":choices},
+                    {"id":"macro","label":"Keyboard symbol / Input Remapper macro","kind":"text","value":"key(KEY_A).wait(100).key(KEY_B)"}
+                ]
+            })));
+        } else {
+            group.rows.push(Row::info(
+                format!("create-unavailable:{row_id}"),
+                "Native macro trigger selection unavailable",
+                format!("No readable advertised key/button inputs: {}. Use the full editor to record analog inputs or combinations. No independent paddle events are inferred.", text(backend, "input_error")),
+            ));
+        }
+        let count = backend
+            .get("presets")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        group.rows.push(Row::info(
+            format!("presets:{row_id}"),
+            format!("{count} saved software presets"),
+            "Open Input Remapper to browse, edit, apply or stop presets, including names created in its editor. Saving here never injects keys, enables autoload or changes another device's running mappings.",
+        ));
     }
     group
 }
+
 pub async fn action(args: &Value) -> Result<()> {
-    match string_arg(args, "operation")? {
-        "editor" => {
-            let binary = executable("input-remapper-gtk")
-                .context("Install Input Remapper's actual GUI before editing mappings/macros")?;
-            Command::new(binary)
-                .process_group(0)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context(
-                    "Launching Input Remapper; its own service authentication remains required",
-                )?;
-        }
-        operation @ ("start" | "stop") => {
-            let device = usb::find(string_arg(args, "device")?)?;
-            if !device.is_controller() && !matches!(device.product_id, 0x0086 | 0x0088) {
-                bail!("Remapping action is restricted to connected mouse/controller products");
-            }
-            let binary = executable("input-remapper-control")
-                .context("Input Remapper control command is not installed")?;
-            let nodes = input::nodes(&device)?;
-            let node = nodes
-                .first()
-                .context("No current physical input node for this product")?;
-            let mut command = tokio::process::Command::new(binary);
-            command.kill_on_drop(true);
-            command
-                .args(["--command", operation, "--device"])
-                .arg(&node.path);
-            if operation == "start" {
-                let preset = args
-                    .get("value")
-                    .and_then(|value| value.get("preset"))
-                    .and_then(Value::as_str)
-                    .context("Form args.value.preset must name an existing preset")?;
-                if preset.is_empty() || !presets(&device).iter().any(|name| name == preset) {
-                    bail!("Select an existing device-specific preset");
-                }
-                command.arg("--preset").arg(preset);
-            }
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                command.stdin(Stdio::null()).output(),
-            )
-            .await
-            .context("Input Remapper service timed out")?
-            .context("Communicating with the actual Input Remapper service")?;
-            if !output.status.success() {
-                bail!(
-                    "Input Remapper failed: {} {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            // The upstream CLI starts asynchronously; do not equate exit success
-            // with proven injection/hardware state. The editor shows service state.
-        }
-        _ => bail!("Unknown Input Remapper action"),
+    let operation = string_arg(args, "operation")?;
+    if !matches!(operation, "editor" | "save") {
+        bail!("Unknown Input Remapper action");
     }
+    let device = usb::find(string_arg(args, "device")?)?;
+    if !supports_remapping(&device) {
+        bail!("Remapping is restricted to connected mouse/keyboard/keypad/controller products");
+    }
+    let paths = device_paths(&device)?;
+    if paths.is_empty() {
+        bail!("No physical input nodes for this connected product");
+    }
+    let key = string_arg(args, "group")?;
+    let mut request = json!({"operation":operation,"paths":paths,"group":key});
+    if operation == "editor" {
+        // There is no --device flag in upstream input-remapper-gtk. Validate the
+        // scoped group, then launch without inventing one or altering global config.
+        let discovered = backend_action(&json!({"operation":"discover","paths":paths})).await?;
+        if !discovered
+            .get("groups")
+            .and_then(Value::as_array)
+            .is_some_and(|groups| groups.iter().any(|group| text(group, "key") == key))
+        {
+            bail!("Selected Input Remapper group is no longer connected; refresh devices");
+        }
+        let binary = executable("input-remapper-gtk")
+            .context("Install Input Remapper's actual GTK editor first")?;
+        Command::new(binary)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context(
+                "Launching the real Input Remapper editor; select the named device group in its UI",
+            )?;
+        return Ok(());
+    }
+    let values = args.get("value").unwrap_or(&Value::Null);
+    for field in ["name", "input", "macro"] {
+        request[field] = Value::String(string_arg(values, field)?.to_owned());
+    }
+    backend_action(&request).await?;
     Ok(())
+}
+
+async fn backend_action(request: &Value) -> Result<Value> {
+    let mut command = tokio::process::Command::new(python()?);
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        command
+            .args(["-I", "-c", BACKEND])
+            .arg(request.to_string())
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .context("Input Remapper timed out; refresh its daemon state before retrying")?
+    .context("Communicating with the installed Input Remapper backend")?;
+    decode(output)
 }

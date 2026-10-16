@@ -148,8 +148,8 @@ fn current(device: &DeviceSnapshot) -> Result<Current> {
     let product_id = device
         .product_id()
         .context("Current device VID/PID unavailable")?;
-    if !matches!(product_id, 0x0086 | 0x0088) {
-        bail!("Host DPI presets are established only for Basilisk Ultimate 0086/0088");
+    if !(0x0001..=0x00ff).contains(&product_id) || matches!(product_id, 0x007e | 0x00a4) {
+        bail!("Host DPI presets are established only for Razer mice");
     }
     Ok((pair, max, product_id))
 }

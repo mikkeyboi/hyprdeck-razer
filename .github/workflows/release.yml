@@ -43,6 +43,7 @@ jobs:
           mkdir -p dist
           install -m 0755 target/release/hyprdeck-razer "dist/$ASSET"
           install -m 0644 plugin.json dist/plugin.json
+          install -m 0644 data/70-hyprdeck-wolverine.rules dist/70-hyprdeck-wolverine.rules
           (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
           printf '%s\n' '{"api_version":1,"method":"state","action":null,"args":{}}' | "dist/$ASSET" --request | jq -e '.api_version == 1 and .error == null'
       - uses: actions/upload-artifact@v7

@@ -1,9 +1,11 @@
 use crate::{ControllerInput, Group, Row, usb};
 use anyhow::{Context, Result, bail};
 use evdev::raw_stream::RawDevice;
-use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, AttributeSetRef, KeyCode};
+use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, AttributeSetRef, FFEffectCode, KeyCode};
 use serde_json::json;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
@@ -37,6 +39,106 @@ pub fn nodes(device: &usb::Device) -> Result<Vec<Node>> {
     nodes.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(nodes)
 }
+// Sysfs bitmaps are most-significant native-word first. Inspect advertised
+// capabilities without opening unrelated keyboard/mouse nodes (or requiring
+// permissions for those nodes).
+fn capability(bits: &str, code: u16) -> bool {
+    let word_bits = usize::BITS as usize;
+    bits.split_whitespace()
+        .rev()
+        .nth(usize::from(code) / word_bits)
+        .and_then(|word| usize::from_str_radix(word, 16).ok())
+        .is_some_and(|word| word & (1usize << (usize::from(code) % word_bits)) != 0)
+}
+
+/// Select the physical device's gamepad, never its keyboard, mouse or auxiliary
+/// sensor event node. The returned ID is accepted by measure() and rumble().
+pub fn primary_node(device: &usb::Device) -> Result<Option<Node>> {
+    let mut best = None;
+    let mut best_score = 0;
+    for node in nodes(device)? {
+        let Some(event) = node.path.file_name() else {
+            continue;
+        };
+        let caps = PathBuf::from("/sys/class/input")
+            .join(event)
+            .join("device/capabilities");
+        let Some(keys) = usb::text(caps.join("key")) else {
+            continue;
+        };
+        let Some(axes) = usb::text(caps.join("abs")) else {
+            continue;
+        };
+        if !capability(&keys, KeyCode::BTN_SOUTH.0)
+            || !capability(&axes, AbsoluteAxisCode::ABS_X.0)
+            || !capability(&axes, AbsoluteAxisCode::ABS_Y.0)
+        {
+            continue;
+        }
+        let layout = AxisLayout::advertised(|axis| capability(&axes, axis.0));
+        let score = 1
+            + usize::from(layout.right.is_some()) * 4
+            + usize::from(layout.left_trigger.is_some())
+            + usize::from(layout.right_trigger.is_some())
+            + usize::from(capability(&keys, KeyCode::BTN_THUMBR.0));
+        if score > best_score {
+            best_score = score;
+            best = Some(node);
+        }
+    }
+    Ok(best)
+}
+
+pub fn supports_rumble(node: &Node) -> Result<bool> {
+    Ok(open(node)?
+        .supported_ff()
+        .is_some_and(|effects| effects.contains(FFEffectCode::FF_RUMBLE)))
+}
+
+#[derive(Clone, Copy)]
+struct AxisLayout {
+    right: Option<(AbsoluteAxisCode, AbsoluteAxisCode)>,
+    left_trigger: Option<AbsoluteAxisCode>,
+    right_trigger: Option<AbsoluteAxisCode>,
+}
+impl AxisLayout {
+    fn advertised(has: impl Fn(AbsoluteAxisCode) -> bool) -> Self {
+        use AbsoluteAxisCode as A;
+        let rx_ry = has(A::ABS_RX) && has(A::ABS_RY);
+        // HID Wolverine PC mode advertises X/Y/Z/RZ + BRAKE/GAS; xpad uses
+        // X/Y/RX/RY + Z/RZ. Never mistake the centered HID Z stick for LT.
+        let hid_right =
+            !rx_ry && has(A::ABS_Z) && has(A::ABS_RZ) && has(A::ABS_BRAKE) && has(A::ABS_GAS);
+        Self {
+            right: if rx_ry {
+                Some((A::ABS_RX, A::ABS_RY))
+            } else if hid_right {
+                Some((A::ABS_Z, A::ABS_RZ))
+            } else {
+                None
+            },
+            left_trigger: if has(A::ABS_BRAKE) {
+                Some(A::ABS_BRAKE)
+            } else if !hid_right && has(A::ABS_Z) {
+                Some(A::ABS_Z)
+            } else {
+                None
+            },
+            right_trigger: if has(A::ABS_GAS) {
+                Some(A::ABS_GAS)
+            } else if !hid_right && has(A::ABS_RZ) {
+                Some(A::ABS_RZ)
+            } else {
+                None
+            },
+        }
+    }
+    fn from_state(state: Option<&KernelState>) -> Self {
+        Self::advertised(|axis| {
+            state.is_some_and(|state| state.axes[usize::from(axis.0)].is_some())
+        })
+    }
+}
 fn open(node: &Node) -> Result<RawDevice> {
     // O_RDONLY is intentional: diagnostics cannot inject events, upload force feedback,
     // or claim exclusive ownership. from_fd avoids evdev's read/write open helper.
@@ -67,6 +169,44 @@ fn read_state(device: &RawDevice) -> Result<KernelState> {
         }
     }
     Ok(KernelState { keys, axes })
+}
+
+impl KernelState {
+    // Update initialized capabilities only: an unsupported axis must stay unknown.
+    fn apply(&mut self, event: &evdev::InputEvent) -> bool {
+        match event.event_type().0 {
+            1 => {
+                let Some(keys) = self.keys.as_mut() else {
+                    return false;
+                };
+                let key = KeyCode(event.code());
+                let pressed = event.value() != 0;
+                let changed = keys.contains(key) != pressed;
+                if pressed {
+                    keys.insert(key);
+                } else {
+                    keys.remove(key);
+                }
+                changed
+            }
+            3 => {
+                let Some(Some(info)) = self.axes.get_mut(usize::from(event.code())) else {
+                    return false;
+                };
+                let changed = info.value() != event.value();
+                *info = AbsInfo::new(
+                    event.value(),
+                    info.minimum(),
+                    info.maximum(),
+                    info.fuzz(),
+                    info.flat(),
+                    info.resolution(),
+                );
+                changed
+            }
+            _ => false,
+        }
+    }
 }
 
 fn normalized(info: &AbsInfo) -> Option<f64> {
@@ -117,14 +257,13 @@ fn controller_inputs(
             .and_then(|_| state?.keys.as_ref().map(|keys| keys.contains(key)))
     };
     let axis = |code: AbsoluteAxisCode| state?.axes[usize::from(code.0)].as_ref();
+    let layout = AxisLayout::from_state(state);
     let mut inputs = Vec::with_capacity(if rear { 23 } else { 17 });
     for (id, label, key) in BUTTONS {
         let mut input = ControllerInput {
             id: id.into(),
             label: label.into(),
-            detail: format!(
-                "Standard Xbox output ({key:?}). Inspect-only: onboard mapping is not readable or writable via xpad/evdev. A mapped extra button can produce this same output."
-            ),
+            detail: format!("Standard gamepad button ({key:?})."),
             pressed: pressed(key),
             value: None,
             x: None,
@@ -133,13 +272,15 @@ fn controller_inputs(
         };
         let stick = match id {
             "left_stick" => Some((AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)),
-            "right_stick" => Some((AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY)),
+            "right_stick" => layout.right,
             _ => None,
         };
         if let Some((x, y)) = stick {
             input.x = axis(x).and_then(normalized_stick);
             input.y = axis(y).and_then(normalized_stick);
-            input.detail = "Position uses the kernel's advertised axis ranges: −1..1, negative Y is up. Stick click is the standard L3/R3 output. No dead zone, sensitivity, profile or calibration setting is changed.".into();
+            input.detail = format!(
+                "Normalized {x:?}/{y:?} axes (−1.0 to +1.0) and stick click; range comes from the kernel."
+            );
         }
         inputs.push(input);
     }
@@ -147,22 +288,22 @@ fn controller_inputs(
         (
             "lt",
             "Left trigger · LT",
-            AbsoluteAxisCode::ABS_Z,
+            layout.left_trigger,
             KeyCode::BTN_TL2,
         ),
         (
             "rt",
             "Right trigger · RT",
-            AbsoluteAxisCode::ABS_RZ,
+            layout.right_trigger,
             KeyCode::BTN_TR2,
         ),
     ] {
         inputs.push(ControllerInput {
             id: id.into(),
             label: label.into(),
-            detail: "Analog travel is normalized to 0..1 using the kernel's advertised range. A digital-only trigger is reported only if the device exports its button. Physical trigger-lock position is not readable.".into(),
+            detail: "Analog trigger travel (0–100%). Toggle rear HyperTrigger locks on the controller for instant mouse-click vs full-range analog pull.".into(),
             pressed: pressed(key),
-            value: axis(code).and_then(normalized),
+            value: code.and_then(axis).and_then(normalized),
             x: None,
             y: None,
             control: None,
@@ -201,10 +342,16 @@ fn controller_inputs(
         inputs.push(ControllerInput {
             id: id.into(),
             label: label.into(),
-            detail: "Standard D-pad output, read from the supported hat axis or digital button. Diagonal directions can both be active.".into(),
+            detail: "8-way floating D-pad directional input.".into(),
             pressed: axis(code)
                 .filter(|info| info.minimum() < 0 && info.maximum() > 0)
-                .map(|info| if negative { info.value() < 0 } else { info.value() > 0 })
+                .map(|info| {
+                    if negative {
+                        info.value() < 0
+                    } else {
+                        info.value() > 0
+                    }
+                })
                 .or_else(|| pressed(key)),
             value: None,
             x: None,
@@ -213,11 +360,18 @@ fn controller_inputs(
         });
     }
     if rear {
-        for index in 1..=6 {
+        for (index, placement) in [
+            (1, "Left claw-grip bumper · M1"),
+            (2, "Right claw-grip bumper · M2"),
+            (3, "Upper-left magnetic paddle · M3"),
+            (4, "Upper-right magnetic paddle · M4"),
+            (5, "Lower-left magnetic paddle · M5"),
+            (6, "Lower-right magnetic paddle · M6"),
+        ] {
             inputs.push(ControllerInput {
                 id: format!("m{index}"),
-                label: format!("Extra button · M{index}"),
-                detail: "Independent press and onboard assignment are unavailable via standard xpad/evdev. Pressing a mapped extra button may highlight its assigned standard output on the front, not identify this button. Use Razer Controller Setup for Xbox on a supported Windows/Xbox system; Hyprdeck cannot read or write that profile.".into(),
+                label: placement.into(),
+                detail: "Hardware-mapped extra button. Edit its onboard action in Buttons or Keys & Macros. This input mode may report only the assigned output, not an independent M-button press.".into(),
                 pressed: None,
                 value: None,
                 x: None,
@@ -229,18 +383,264 @@ fn controller_inputs(
     inputs
 }
 
+fn update_inputs(
+    inputs: &mut [ControllerInput],
+    supported: Option<&AttributeSetRef<KeyCode>>,
+    state: &KernelState,
+    layout: AxisLayout,
+) {
+    let pressed = |key| {
+        supported
+            .filter(|keys| keys.contains(key))
+            .and_then(|_| state.keys.as_ref().map(|keys| keys.contains(key)))
+    };
+    let axis = |code: AbsoluteAxisCode| state.axes[usize::from(code.0)].as_ref();
+    for (input, (_, _, key)) in inputs.iter_mut().zip(BUTTONS) {
+        input.pressed = pressed(key);
+    }
+    for (index, axes) in [
+        (9, Some((AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y))),
+        (10, layout.right),
+    ] {
+        inputs[index].x = axes.and_then(|(x, _)| axis(x)).and_then(normalized_stick);
+        inputs[index].y = axes.and_then(|(_, y)| axis(y)).and_then(normalized_stick);
+    }
+    for (index, code, key) in [
+        (11, layout.left_trigger, KeyCode::BTN_TL2),
+        (12, layout.right_trigger, KeyCode::BTN_TR2),
+    ] {
+        inputs[index].value = code.and_then(axis).and_then(normalized);
+        inputs[index].pressed = pressed(key);
+    }
+    for (index, code, negative, key) in [
+        (13, AbsoluteAxisCode::ABS_HAT0Y, true, KeyCode::BTN_DPAD_UP),
+        (
+            14,
+            AbsoluteAxisCode::ABS_HAT0Y,
+            false,
+            KeyCode::BTN_DPAD_DOWN,
+        ),
+        (
+            15,
+            AbsoluteAxisCode::ABS_HAT0X,
+            true,
+            KeyCode::BTN_DPAD_LEFT,
+        ),
+        (
+            16,
+            AbsoluteAxisCode::ABS_HAT0X,
+            false,
+            KeyCode::BTN_DPAD_RIGHT,
+        ),
+    ] {
+        inputs[index].pressed = axis(code)
+            .filter(|info| info.minimum() < 0 && info.maximum() > 0)
+            .map(|info| {
+                if negative {
+                    info.value() < 0
+                } else {
+                    info.value() > 0
+                }
+            })
+            .or_else(|| pressed(key));
+    }
+}
+
 pub fn unknown_controller_inputs() -> Vec<ControllerInput> {
     controller_inputs(None, None, true)
+}
+
+// Read fixed-size batches without an allocation per event. InputEvent is a
+// repr(transparent) wrapper of Linux input_event, containing only integer fields.
+fn read_events(device: &RawDevice, events: &mut [evdev::InputEvent]) -> io::Result<usize> {
+    let bytes = unsafe {
+        libc::read(
+            device.as_raw_fd(),
+            events.as_mut_ptr().cast(),
+            std::mem::size_of_val(events),
+        )
+    };
+    if bytes < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Input device disconnected (evdev EOF)",
+        ));
+    }
+    if !(bytes as usize).is_multiple_of(std::mem::size_of::<evdev::InputEvent>()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Incomplete evdev event record",
+        ));
+    }
+    Ok(bytes as usize / std::mem::size_of::<evdev::InputEvent>())
+}
+
+fn emit_frame(output: &mut impl Write, inputs: &[ControllerInput], status: &str) -> Result<bool> {
+    #[derive(serde::Serialize)]
+    struct Frame<'a> {
+        inputs: &'a [ControllerInput],
+        status: &'a str,
+    }
+    if let Err(error) = serde_json::to_writer(&mut *output, &Frame { inputs, status }) {
+        if error.io_error_kind() == Some(io::ErrorKind::BrokenPipe) {
+            return Ok(false);
+        }
+        return Err(error).context("Writing live input frame");
+    }
+    match output.write_all(b"\n").and_then(|_| output.flush()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error).context("Flushing live input frame"),
+    }
+}
+
+/// Nonexclusive live input for exactly the currently enumerated physical USB
+/// device. No grabs, driver detach, force-feedback uploads or HID writes.
+pub fn stream(id: &str) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = BufWriter::with_capacity(16 * 1024, stdout.lock());
+    match stream_to(id, &mut output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A stale last position must not look live after removal/read failure.
+            let status = format!("Input disconnected / unavailable: {error:#}");
+            if !emit_frame(&mut output, &unknown_controller_inputs(), &status)? {
+                return Ok(());
+            }
+            Err(error)
+        }
+    }
+}
+
+fn stream_to(id: &str, output: &mut impl Write) -> Result<()> {
+    let physical = usb::find(id)?;
+    let node =
+        primary_node(&physical)?.context("No gamepad event node on this physical USB device")?;
+    let device = open(&node)?;
+    let mut state = read_state(&device)?;
+    let layout = AxisLayout::from_state(Some(&state));
+    let mut inputs = controller_inputs(
+        device.supported_keys(),
+        Some(&state),
+        physical.has_rear_buttons(),
+    );
+    if !emit_frame(output, &inputs, "Live input")? {
+        return Ok(());
+    }
+    let frame_interval = Duration::from_nanos(16_666_667);
+    let mut last_axis_frame = Instant::now();
+    let mut pending_axis = false;
+    let mut lost = false;
+    let mut events = [evdev::InputEvent::new(0, 0, 0); 64];
+    loop {
+        let timeout = if pending_axis && !lost {
+            let remaining = frame_interval.saturating_sub(last_axis_frame.elapsed());
+            if remaining.is_zero() {
+                0
+            } else {
+                remaining.as_millis().saturating_add(1) as i32
+            }
+        } else {
+            -1
+        };
+        let mut descriptor = libc::pollfd {
+            fd: device.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("Polling live input");
+        }
+        if descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("Gamepad disconnected or evdev stream unavailable");
+        }
+        if result > 0 {
+            let count = match read_events(&device, &mut events) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error).context("Reading live gamepad input"),
+            };
+            for event in &events[..count] {
+                if event.event_type().0 == 0 && event.code() == 3 {
+                    lost = true;
+                    pending_axis = false;
+                    continue;
+                }
+                if lost {
+                    if event.event_type().0 == 0 && event.code() == 0 {
+                        state =
+                            read_state(&device).context("Resynchronizing dropped live input")?;
+                        lost = false;
+                        update_inputs(&mut inputs, device.supported_keys(), &state, layout);
+                        if !emit_frame(
+                            output,
+                            &inputs,
+                            "Live input · resynchronized after dropped events",
+                        )? {
+                            return Ok(());
+                        }
+                        last_axis_frame = Instant::now();
+                    }
+                    continue;
+                }
+                if state.apply(event) {
+                    let button_edge = event.event_type().0 == 1
+                        || (event.event_type().0 == 3 && matches!(event.code(), 16 | 17));
+                    if button_edge {
+                        update_inputs(&mut inputs, device.supported_keys(), &state, layout);
+                        if !emit_frame(output, &inputs, "Live input")? {
+                            return Ok(());
+                        }
+                        pending_axis = false;
+                        last_axis_frame = Instant::now();
+                    } else if event.event_type().0 == 3 {
+                        pending_axis = true;
+                    }
+                }
+                if event.event_type().0 == 0
+                    && event.code() == 0
+                    && pending_axis
+                    && last_axis_frame.elapsed() >= frame_interval
+                {
+                    update_inputs(&mut inputs, device.supported_keys(), &state, layout);
+                    if !emit_frame(output, &inputs, "Live input")? {
+                        return Ok(());
+                    }
+                    pending_axis = false;
+                    last_axis_frame = Instant::now();
+                }
+            }
+        }
+        if pending_axis && !lost && last_axis_frame.elapsed() >= frame_interval {
+            update_inputs(&mut inputs, device.supported_keys(), &state, layout);
+            if !emit_frame(output, &inputs, "Live input")? {
+                return Ok(());
+            }
+            pending_axis = false;
+            last_axis_frame = Instant::now();
+        }
+    }
 }
 
 pub struct Snapshot {
     pub group: Group,
     pub inputs: Option<Vec<ControllerInput>>,
     pub error: Option<String>,
-}
-
-fn initialized_rows(device: &RawDevice) -> Result<Vec<Row>> {
-    rows_from_state(device, &read_state(device)?)
 }
 
 fn rows_from_state(device: &RawDevice, state: &KernelState) -> Result<Vec<Row>> {
@@ -250,21 +650,24 @@ fn rows_from_state(device: &RawDevice, state: &KernelState) -> Result<Vec<Row>> 
             .keys
             .as_ref()
             .context("Missing queried button state")?;
-        if device.supported_absolute_axes().is_some() {
-            for key in keys.iter() {
-                rows.push(Row::info(
-                    format!("key-{}", key.0),
-                    format!("{key:?} (0x{:03x})", key.0),
-                    if state.contains(key) {
-                        "Pressed"
-                    } else {
-                        "Released"
-                    },
-                ));
+        let mut detail = format!("{} advertised keys. Pressed: ", keys.iter().count());
+        let mut pressed = false;
+        for key in state.iter() {
+            if pressed {
+                detail.push_str(", ");
             }
-        } else {
-            rows.push(Row::info("key-state", "Current buttons / keyboard keys", format!("Pressed: {:?}. Supported: {:?}. All other supported keys are released (fresh EVIOCGKEY).", state.iter().collect::<Vec<_>>(), keys.iter().collect::<Vec<_>>())));
+            let _ = write!(&mut detail, "{key:?}");
+            pressed = true;
         }
+        if !pressed {
+            detail.push_str("none");
+        }
+        detail.push_str(". All other supported keys are released (fresh EVIOCGKEY).");
+        rows.push(Row::info(
+            "key-state",
+            "Current buttons / keyboard keys",
+            detail,
+        ));
     }
     if let Some(axes) = device.supported_absolute_axes() {
         for axis in axes.iter() {
@@ -302,7 +705,7 @@ pub fn snapshot(node: &Node, controller: bool, rear: bool) -> Snapshot {
     )
     .collapsed();
     group.rows.push(Row::info("kernel-name", "Native kernel input name", if controller && node.name.starts_with("Generic X-Box pad") {
-        format!("{} — xpad's native name is unchanged. The original 1532:0a3f identity lacks a named entry in the upstream driver table; a product display label does not rename this kernel device or create headset/battery support.", node.name)
+        format!("{} — xpad's native name is unchanged. This USB identity (e.g. 1532:0a3f or 1532:0a76/0a78) matches xpad's generic vendor/interface wildcard rather than a named entry in xpad_device[]; a product display label does not rename this kernel device or create headset/battery support.", node.name)
     } else {
         node.name.clone()
     }));
@@ -348,8 +751,122 @@ pub fn snapshot(node: &Node, controller: bool, rear: bool) -> Snapshot {
 }
 
 pub fn measurement_row(node: &Node) -> Row {
-    Row::info("measurement", "Measure input cadence", "Move sticks/triggers continuously for four seconds. Changed evdev frames are measured, not every USB packet or internal poll.")
-        .controlled(json!({"kind":"button","label":"Measure input (4 s)","action":"measure","args":{"device":node.id,"seconds":4},"destructive":false}))
+    Row::info(
+        "measurement",
+        "Stick movement & event cadence analyzer",
+        "For 4 seconds, rotate BOTH sticks around their full range, then release to center. Measures observed movement and changed evdev-frame timing, not physical USB polling.",
+    )
+    .controlled(json!({
+        "kind": "button",
+        "label": "Run 4 s test",
+        "action": "measure",
+        "args": {"device": node.id, "seconds": 4},
+        "destructive": false
+    }))
+}
+
+pub fn rumble_row(node: &Node) -> Option<Row> {
+    if !supports_rumble(node).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        Row::info(
+            "rumble",
+            "Haptic rumble test",
+            "Test dual-motor force feedback (heavy low-frequency + sharp high-frequency impulse)",
+        )
+        .controlled(json!({
+            "kind": "form",
+            "label": "Test Rumble",
+            "action": "rumble",
+            "args": {"device": node.id},
+            "fields": [
+                {
+                    "id": "profile",
+                    "label": "Haptic pattern",
+                    "kind": "choice",
+                    "value": "dual",
+                    "options": [
+                        {"value": "dual", "label": "Dual motor pulse (Balanced)"},
+                        {"value": "heavy", "label": "Heavy bass motor (Strong)"},
+                        {"value": "sharp", "label": "High-frequency motor (Crisp)"},
+                        {"value": "double", "label": "Double tap heartbeat"}
+                    ]
+                }
+            ]
+        })),
+    )
+}
+
+pub fn rumble(id: &str, profile: &str) -> Result<Group> {
+    let node = find(id)?;
+    if !supports_rumble(&node)? {
+        bail!("This input node does not advertise evdev FF_RUMBLE; no effect was uploaded");
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&node.path)
+        .with_context(|| {
+            format!(
+                "Opening {} read-write for force feedback",
+                node.path.display()
+            )
+        })?;
+    let (strong, weak, duration_ms, pulses): (u16, u16, u16, usize) = match profile {
+        "heavy" => (0xffff, 0x0000, 450, 1),
+        "sharp" => (0x0000, 0xffff, 350, 1),
+        "double" => (0xc000, 0xa000, 160, 2),
+        _ => (0xb000, 0x8000, 380, 1),
+    };
+    // EVIOCSFF = _IOW('E', 0x80, struct ff_effect) = 0x40304580 on x86_64
+    // EVIOCRMFF = _IOW('E', 0x81, int) = 0x40044581
+    const EVIOCSFF: libc::c_ulong = 0x40304580;
+    const EVIOCRMFF: libc::c_ulong = 0x40044581;
+    let mut effect = [0u8; 48];
+    effect[0..2].copy_from_slice(&0x0050u16.to_ne_bytes()); // FF_RUMBLE
+    effect[2..4].copy_from_slice(&(-1i16).to_ne_bytes()); // id = -1 (allocate)
+    effect[10..12].copy_from_slice(&duration_ms.to_ne_bytes()); // replay.length
+    effect[16..18].copy_from_slice(&strong.to_ne_bytes()); // u.rumble.strong_magnitude
+    effect[18..20].copy_from_slice(&weak.to_ne_bytes()); // u.rumble.weak_magnitude
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCSFF, effect.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Uploading FF_RUMBLE effect via EVIOCSFF");
+    }
+    let effect_id = i16::from_ne_bytes([effect[2], effect[3]]);
+    let mut playback = Ok(());
+    for i in 0..pulses {
+        let mut ev = [0u8; 24];
+        // EV_FF = 0x15, code = effect_id, value = 1 (play)
+        ev[16..18].copy_from_slice(&0x0015u16.to_ne_bytes());
+        ev[18..20].copy_from_slice(&(effect_id as u16).to_ne_bytes());
+        ev[20..24].copy_from_slice(&1i32.to_ne_bytes());
+        if let Err(error) = file.write_all(&ev) {
+            playback = Err(error);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(u64::from(duration_ms) + 40));
+        if i + 1 < pulses {
+            std::thread::sleep(Duration::from_millis(90));
+        }
+    }
+    unsafe {
+        let _ = libc::ioctl(file.as_raw_fd(), EVIOCRMFF, libc::c_int::from(effect_id));
+    }
+    playback.context("Playing evdev force feedback; no successful rumble test result")?;
+    let mut group = Group::new(
+        format!("rumble:{id}"),
+        "Haptic rumble test completed",
+        "Force feedback effect played via Linux evdev FF_RUMBLE",
+    );
+    group.rows.push(Row::info(
+        "status",
+        format!("Played '{profile}' haptic pattern"),
+        format!("Strong motor: 0x{strong:04x}, Weak motor: 0x{weak:04x}, Duration: {duration_ms} ms × {pulses}"),
+    ));
+    Ok(group)
 }
 fn find(id: &str) -> Result<Node> {
     for device in usb::devices()? {
@@ -411,7 +928,7 @@ impl Cadence {
     fn description(&mut self, elapsed: Duration) -> String {
         if self.frames == 0 {
             return format!(
-                "Idle / no changed standard input: 0 frames in {:.3} s. No polling-rate estimate is possible. Move controls throughout measurement. SYN_DROPPED: {}.",
+                "Idle / no changed standard input: 0 frames in {:.3} s. No changed-event cadence sample; physical polling is not measured. Move controls throughout measurement. SYN_DROPPED: {}.",
                 elapsed.as_secs_f64(),
                 self.drops
             );
@@ -430,13 +947,12 @@ impl Cadence {
         let median = self.intervals[self.intervals.len() / 2];
         let p95 = self.intervals[((self.intervals.len() - 1) as f64 * 0.95).round() as usize];
         format!(
-            "{} changed frames in {:.3} s ({:.1} frames/s over observation window); {} valid intervals: mean {:.3} ms ({:.1} Hz reciprocal), median {:.3} ms, p95 {:.3} ms, min {:.3} ms, max {:.3} ms. SYN_DROPPED: {}; invalid/nonmonotonic timestamps: {}. Changed-event cadence only: idle gaps, filtering, radio, kernel batching and application scheduling prevent inferring physical polling.{}",
+            "{} changed frames in {:.3} s ({:.1} frames/s over observation window); {} valid intervals: mean {:.3} ms, median {:.3} ms, p95 {:.3} ms, min {:.3} ms, max {:.3} ms. SYN_DROPPED: {}; invalid/nonmonotonic timestamps: {}. Changed-event cadence only: idle gaps, filtering, radio, kernel batching and application scheduling prevent inferring physical polling.{}",
             self.frames,
             elapsed.as_secs_f64(),
             self.frames as f64 / elapsed.as_secs_f64(),
             self.intervals.len(),
             average,
-            1000.0 / average,
             median,
             p95,
             self.intervals[0],
@@ -451,15 +967,118 @@ impl Cadence {
         )
     }
 }
+struct StickTrace {
+    axes: Option<(AbsoluteAxisCode, AbsoluteAxisCode)>,
+    initial: Option<(f64, f64)>,
+    last: Option<(f64, f64)>,
+    bounds: [f64; 4],
+    samples: u64,
+    path: f64,
+    outer: [Option<f64>; 16],
+}
+impl StickTrace {
+    fn position(
+        axes: Option<(AbsoluteAxisCode, AbsoluteAxisCode)>,
+        state: &KernelState,
+    ) -> Option<(f64, f64)> {
+        let (x, y) = axes?;
+        Some((
+            normalized_stick(state.axes[usize::from(x.0)].as_ref()?)?,
+            normalized_stick(state.axes[usize::from(y.0)].as_ref()?)?,
+        ))
+    }
+    fn new(axes: Option<(AbsoluteAxisCode, AbsoluteAxisCode)>, state: &KernelState) -> Self {
+        let initial = Self::position(axes, state);
+        let (x, y) = initial.unwrap_or((0.0, 0.0));
+        Self {
+            axes,
+            initial,
+            last: initial,
+            bounds: [x, x, y, y],
+            samples: 0,
+            path: 0.0,
+            outer: [None; 16],
+        }
+    }
+    fn uses(&self, code: u16) -> bool {
+        self.axes.is_some_and(|(x, y)| x.0 == code || y.0 == code)
+    }
+    fn observe(&mut self, state: &KernelState) {
+        let Some((x, y)) = Self::position(self.axes, state) else {
+            return;
+        };
+        if self.last == Some((x, y)) {
+            return;
+        }
+        if let Some((px, py)) = self.last {
+            self.path += (x - px).hypot(y - py);
+        }
+        self.last = Some((x, y));
+        self.samples += 1;
+        self.bounds[0] = self.bounds[0].min(x);
+        self.bounds[1] = self.bounds[1].max(x);
+        self.bounds[2] = self.bounds[2].min(y);
+        self.bounds[3] = self.bounds[3].max(y);
+        let radius = x.hypot(y);
+        if radius >= 0.65 {
+            let angle = y.atan2(x).rem_euclid(std::f64::consts::TAU);
+            let sector = ((angle / std::f64::consts::TAU * 16.0) as usize).min(15);
+            self.outer[sector] = Some(self.outer[sector].unwrap_or(0.0).max(radius));
+        }
+    }
+    fn description(&self, state: &KernelState) -> String {
+        if self.initial.is_none() {
+            return "Unavailable: this node does not advertise a complete, normalizable stick axis pair.".into();
+        }
+        let end = Self::position(self.axes, state)
+            .map(|(x, y)| format!("({x:+.3}, {y:+.3}), {:.2}% from center", x.hypot(y) * 100.0))
+            .unwrap_or_else(|| "unknown".into());
+        if self.samples == 0 {
+            return format!(
+                "Idle / no observed stick movement: 0 changed-position samples. Final X/Y: {end}. Center drift requires releasing the stick; release was not verified. Range, path and circularity were not measured."
+            );
+        }
+        let sectors = self.outer.iter().flatten().count();
+        let circle = if sectors == 16 {
+            let rms = (self
+                .outer
+                .iter()
+                .flatten()
+                .map(|radius| (radius - 1.0).powi(2))
+                .sum::<f64>()
+                / 16.0)
+                .sqrt()
+                * 100.0;
+            format!(
+                "Circularity estimate: outer-envelope radial RMS deviation from a unit circle {rms:.2}% (16/16 angular sectors reached; movement-dependent, not a hardware calibration)"
+            )
+        } else {
+            format!(
+                "Circularity not measured: outer travel reached {sectors}/16 angular sectors; rotate a full circle"
+            )
+        };
+        format!(
+            "{} changed-position samples · observed X {:+.3}..{:+.3}, Y {:+.3}..{:+.3} · path {:.3} normalized units. Final X/Y: {end} (release-to-center unverified). {circle}.",
+            self.samples, self.bounds[0], self.bounds[1], self.bounds[2], self.bounds[3], self.path
+        )
+    }
+}
+
 pub fn measure(id: &str, duration: Duration) -> Result<Group> {
     let node = find(id)?;
-    let mut device = open(&node)?;
+    let device = open(&node)?;
+    let mut state = read_state(&device)?;
+    let layout = AxisLayout::from_state(Some(&state));
+    let mut left = StickTrace::new(
+        Some((AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)),
+        &state,
+    );
+    let mut right = StickTrace::new(layout.right, &state);
     let mut group = Group::new(
         format!("measurement:{id}"),
         format!("Measurement: {}", node.name),
         "Nonexclusive changed-input measurement; not USB/sensor physical polling",
     );
-    group.rows.extend(initialized_rows(&device)?);
     // Use kernel monotonic timestamps if supported. Failure leaves default realtime
     // timestamps; nonmonotonic intervals are rejected rather than fabricated.
     let clock = libc::CLOCK_MONOTONIC;
@@ -467,6 +1086,9 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
         unsafe { libc::ioctl(device.as_raw_fd(), 0x400445a0 as libc::c_ulong, &clock) } >= 0;
     let start = Instant::now();
     let mut cadence = Cadence::default();
+    let mut events = [evdev::InputEvent::new(0, 0, 0); 64];
+    let mut lost = false;
+    let mut stick_changed = [false; 2];
     while start.elapsed() < duration {
         let remaining = duration.saturating_sub(start.elapsed());
         let timeout = remaining.as_millis().clamp(1, 100) as i32;
@@ -491,38 +1113,70 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
         if status == 0 {
             continue;
         }
-        match device.fetch_events() {
-            Ok(events) => {
-                for event in events {
-                    cadence.feed(&event);
-                }
+        let count = match read_events(&device, &mut events) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 return Err(error).context("Reading changed input; device may have been removed");
+            }
+        };
+        for event in &events[..count] {
+            cadence.feed(event);
+            if event.event_type().0 == 0 && event.code() == 3 {
+                lost = true;
+                stick_changed = [false; 2];
+                left.last = None;
+                right.last = None;
+                continue;
+            }
+            if lost {
+                if event.event_type().0 == 0 && event.code() == 0 {
+                    state = read_state(&device)
+                        .context("Resynchronizing measurement after dropped events")?;
+                    lost = false;
+                }
+                continue;
+            }
+            if state.apply(event) && event.event_type().0 == 3 {
+                stick_changed[0] |= left.uses(event.code());
+                stick_changed[1] |= right.uses(event.code());
+            }
+            if event.event_type().0 == 0 && event.code() == 0 {
+                if stick_changed[0] {
+                    left.observe(&state);
+                }
+                if stick_changed[1] {
+                    right.observe(&state);
+                }
+                stick_changed = [false; 2];
             }
         }
     }
     let elapsed = start.elapsed();
+    let final_state = read_state(&device)?;
     let summary = Row::info(
         "last-measurement",
-        "Last input measurement",
-        if cadence.frames < 2 {
-            format!(
-                "{} changed frames in {:.2} s · no polling estimate. SYN_DROPPED: {}.",
-                cadence.frames,
-                elapsed.as_secs_f64(),
-                cadence.drops
-            )
-        } else {
-            format!(
-                "{} changed frames in {:.2} s · {:.1} changed frames/s, not physical polling. SYN_DROPPED: {}.",
-                cadence.frames,
-                elapsed.as_secs_f64(),
-                cadence.frames as f64 / elapsed.as_secs_f64(),
-                cadence.drops
-            )
-        },
+        "Last stick movement & event cadence test",
+        format!(
+            "Left: {} movement samples · Right: {} movement samples · {} changed evdev frames / {:.1} s ({:.1} frames/s observed). {}Physical polling is not measured.",
+            left.samples,
+            right.samples,
+            cadence.frames,
+            elapsed.as_secs_f64(),
+            cadence.frames as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
+            if left.samples == 0 && right.samples == 0 {
+                "No stick movement observed; rotate both sticks during the test. "
+            } else {
+                ""
+            }
+        ),
     );
     group.rows.insert(
         0,
@@ -544,14 +1198,24 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
             },
         ),
     );
-    group.rows.push(Row::info(
-        "final-state",
-        "Final input state",
-        "Fresh ioctl snapshot after measurement (recovers state after any SYN_DROPPED).",
-    ));
-    for mut row in initialized_rows(&device)? {
-        row.id = format!("final-{}", row.id);
-        group.rows.push(row);
+    group.rows.insert(
+        0,
+        Row::info(
+            "left-stick-analysis",
+            "Left stick · observed movement",
+            left.description(&final_state),
+        ),
+    );
+    group.rows.insert(
+        1,
+        Row::info(
+            "right-stick-analysis",
+            "Right stick · observed movement",
+            right.description(&final_state),
+        ),
+    );
+    if cadence.drops > 0 {
+        group.rows.insert(2, Row::info("incomplete-movement", "Incomplete movement sample", "Events were dropped. State was resynchronized; path skips lost segments and range/circularity may be incomplete. Repeat the test under lower load."));
     }
     crate::cache::store("measurement", id, &group, &summary)?;
     Ok(group)
@@ -560,6 +1224,145 @@ pub fn measure(id: &str, duration: Duration) -> Result<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_gamepad_bitmap_excludes_auxiliary_nodes() {
+        assert!(capability(
+            "7fff000000000000 0 8000000000 0 0",
+            KeyCode::BTN_SOUTH.0
+        ));
+        assert!(!capability("1f0000 0 0 0 0", KeyCode::BTN_SOUTH.0));
+        assert!(capability("30627", AbsoluteAxisCode::ABS_BRAKE.0));
+        assert!(!capability("30627", AbsoluteAxisCode::ABS_RX.0));
+    }
+
+    #[test]
+    fn hid_pc_axes_initialize_both_sticks_and_unpulled_triggers() {
+        let mut state = KernelState {
+            keys: Some(AttributeSet::new()),
+            axes: [None; 64],
+        };
+        for code in [0, 1, 2, 5] {
+            state.axes[code] = Some(AbsInfo::new(32757, 0, 65535, 255, 4095, 0));
+        }
+        for code in [9, 10] {
+            state.axes[code] = Some(AbsInfo::new(1, 0, 1023, 3, 63, 0));
+        }
+        let layout = AxisLayout::from_state(Some(&state));
+        assert_eq!(
+            layout.right,
+            Some((AbsoluteAxisCode::ABS_Z, AbsoluteAxisCode::ABS_RZ))
+        );
+        assert_eq!(layout.left_trigger, Some(AbsoluteAxisCode::ABS_BRAKE));
+        assert_eq!(layout.right_trigger, Some(AbsoluteAxisCode::ABS_GAS));
+        let mut inputs = controller_inputs(None, Some(&state), true);
+        for id in ["left_stick", "right_stick"] {
+            let input = inputs.iter().find(|input| input.id == id).unwrap();
+            assert!(input.x.unwrap().abs() < 0.001 && input.y.unwrap().abs() < 0.001);
+        }
+        for id in ["lt", "rt"] {
+            assert!(
+                inputs
+                    .iter()
+                    .find(|input| input.id == id)
+                    .unwrap()
+                    .value
+                    .unwrap()
+                    < 0.002
+            );
+        }
+        assert!(state.apply(&evdev::InputEvent::new(3, 2, 65535)));
+        assert!(state.apply(&evdev::InputEvent::new(3, 10, 1023)));
+        assert!(!state.apply(&evdev::InputEvent::new(3, 3, 42)));
+        update_inputs(&mut inputs, None, &state, layout);
+        assert_eq!(
+            inputs
+                .iter()
+                .find(|input| input.id == "right_stick")
+                .unwrap()
+                .x,
+            Some(1.0)
+        );
+        assert_eq!(
+            inputs.iter().find(|input| input.id == "lt").unwrap().value,
+            Some(1.0)
+        );
+        assert!(state.axes[3].is_none());
+    }
+
+    #[test]
+    fn xpad_axes_keep_separate_right_stick_and_triggers() {
+        let layout = AxisLayout::advertised(|axis| matches!(axis.0, 0..=5));
+        assert_eq!(
+            layout.right,
+            Some((AbsoluteAxisCode::ABS_RX, AbsoluteAxisCode::ABS_RY))
+        );
+        assert_eq!(layout.left_trigger, Some(AbsoluteAxisCode::ABS_Z));
+        assert_eq!(layout.right_trigger, Some(AbsoluteAxisCode::ABS_RZ));
+        assert!(AxisLayout::advertised(|_| false).right.is_none());
+    }
+
+    #[test]
+    fn stick_analysis_requires_movement_and_full_outer_coverage() {
+        let mut state = KernelState {
+            keys: None,
+            axes: [None; 64],
+        };
+        for code in [0, 1] {
+            state.axes[code] = Some(AbsInfo::new(0, -1000, 1000, 0, 0, 0));
+        }
+        let mut trace = StickTrace::new(
+            Some((AbsoluteAxisCode::ABS_X, AbsoluteAxisCode::ABS_Y)),
+            &state,
+        );
+        assert!(
+            trace
+                .description(&state)
+                .contains("Idle / no observed stick movement")
+        );
+        for sector in 0..16 {
+            let angle = (f64::from(sector) + 0.5) / 16.0 * std::f64::consts::TAU;
+            state.apply(&evdev::InputEvent::new(
+                3,
+                0,
+                (angle.cos() * 1000.0).round() as i32,
+            ));
+            state.apply(&evdev::InputEvent::new(
+                3,
+                1,
+                (angle.sin() * 1000.0).round() as i32,
+            ));
+            trace.observe(&state);
+        }
+        assert_eq!(trace.samples, 16);
+        assert!(trace.path > 6.0);
+        assert!(trace.description(&state).contains("Circularity estimate"));
+        assert!(
+            trace
+                .description(&state)
+                .contains("release-to-center unverified")
+        );
+    }
+
+    #[test]
+    fn live_button_edges_update_initialized_inputs_without_rebuilding_metadata() {
+        let supported: AttributeSet<KeyCode> = [KeyCode::BTN_SOUTH].into_iter().collect();
+        let mut state = KernelState {
+            keys: Some(AttributeSet::new()),
+            axes: [None; 64],
+        };
+        let layout = AxisLayout::from_state(Some(&state));
+        let mut inputs = controller_inputs(Some(&supported), Some(&state), true);
+        assert_eq!(inputs[0].pressed, Some(false));
+        assert!(state.apply(&evdev::InputEvent::new(1, KeyCode::BTN_SOUTH.0, 1)));
+        update_inputs(&mut inputs, Some(&supported), &state, layout);
+        assert_eq!(inputs[0].pressed, Some(true));
+        assert!(!state.apply(&evdev::InputEvent::new(1, KeyCode::BTN_SOUTH.0, 2)));
+        assert!(state.apply(&evdev::InputEvent::new(1, KeyCode::BTN_SOUTH.0, 0)));
+        update_inputs(&mut inputs, Some(&supported), &state, layout);
+        assert_eq!(inputs[0].pressed, Some(false));
+        assert!(inputs[17..].iter().all(|input| input.pressed.is_none()));
+    }
     #[test]
     fn idle_and_loss_are_not_fake_polling() {
         let mut cadence = Cadence::default();
