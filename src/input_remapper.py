@@ -1,8 +1,8 @@
 """Small JSON bridge to the installed Input Remapper v2 backend, not an injector.
 
-Uses upstream groups, paths, Mapping/Preset validation and the system-bus daemon.
+Uses upstream groups, paths and Mapping/Preset validation, never root injectors.
 API reference: sezanzeb/input-remapper 0092e33ed13592dd937297d5032db9d908db8f9e.
-Only explicit save/start/stop requests mutate state; discovery never starts services.
+Only explicit preset saves mutate state. Apply/stop belongs to the upstream editor.
 """
 
 import contextlib
@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import signal
 import sys
-import time
 
 
 def expired(_signal, _frame):
@@ -44,23 +43,6 @@ def discover_groups(paths):
     return matches
 
 
-def service():
-    # Do not use Daemon.connect(): even a read would then set_config_dir, and its
-    # default fallback can run pkexec. No implicit daemon startup or authentication.
-    from inputremapper.daemon import DAEMON
-
-    proxy = DAEMON.get_proxy()
-    proxy.Introspect(timeout=1000)
-    return proxy
-
-
-def state(proxy, group):
-    return {
-        "state": str(proxy.get_state(group.key, timeout=1000)),
-        "preset": proxy.get_running_preset(group.key, timeout=1000),
-        "suspended": proxy.is_suspended(timeout=1000),
-    }
-
 
 def inputs(group):
     import evdev
@@ -81,6 +63,22 @@ def inputs(group):
     return sorted(result, key=lambda item: item["label"])
 
 
+def preset_directory(group):
+    from inputremapper.configs.paths import PathUtils
+
+    root = Path(PathUtils.get_preset_path())
+    directory = Path(group.get_preset_path())
+    if (
+        not root.is_absolute()
+        or directory.parent != root
+        or directory.name in (".", "..")
+        or directory.is_symlink()
+        or directory.resolve().parent != root.resolve()
+    ):
+        raise ValueError("Unsafe device-model preset directory; no file was read or saved")
+    return directory
+
+
 def preset_path(group, name):
     if (
         not isinstance(name, str)
@@ -93,7 +91,11 @@ def preset_path(group, name):
         or any(ord(character) < 32 for character in name)
     ):
         raise ValueError("Use a preset name of 1–80 characters without dots, slashes or reserved filename characters")
-    return Path(group.get_preset_path(name))
+    directory = preset_directory(group)
+    path = Path(group.get_preset_path(name))
+    if path.parent != directory or path.resolve().parent != directory.resolve():
+        raise ValueError("Preset path escapes its device-model directory")
+    return path
 
 
 def load_preset(path):
@@ -113,13 +115,12 @@ def load_preset(path):
     return preset
 
 
-def describe(group, proxy, service_error):
-    directory = Path(group.get_preset_path())
+def describe(group):
+    directory = preset_directory(group)
     presets = []
     if directory.is_dir():
         for path in sorted(directory.glob("*.json")):
-            # Validation happens at application, not by executing every macro
-            # parser while merely displaying inventory.
+            # Inventory never executes macro parsers or controls root injectors.
             presets.append(path.stem)
     description = {
         "key": group.key,
@@ -133,12 +134,6 @@ def describe(group, proxy, service_error):
         description["inputs"] = inputs(group)
     except Exception as error:
         description["input_error"] = str(error)
-    try:
-        if proxy is None:
-            raise RuntimeError(service_error)
-        description.update(state(proxy, group))
-    except Exception as error:
-        description["service_error"] = str(error)
     return description
 
 
@@ -146,11 +141,7 @@ def main(request):
     groups = discover_groups(request["paths"])
     operation = request["operation"]
     if operation == "discover":
-        try:
-            proxy, error = service(), None
-        except Exception as exception:
-            proxy, error = None, str(exception)
-        return {"groups": [describe(group, proxy, error) for group in groups]}
+        return {"groups": [describe(group) for group in groups]}
 
     group = next((group for group in groups if group.key == request["group"]), None)
     if group is None:
@@ -195,50 +186,7 @@ def main(request):
         load_preset(path)
         return {"saved": str(path)}
 
-    proxy = service()
-    if operation == "start":
-        from inputremapper.configs.paths import PathUtils
-        from inputremapper.configs.global_config import INITIAL_CONFIG
-
-        name = request["preset"]
-        path = preset_path(group, name)
-        load_preset(path)
-        if proxy.is_suspended(timeout=1000):
-            raise ValueError("Input Remapper is globally suspended; resume it in its editor first. Hyprdeck will not change other device mappings")
-        # The daemon refuses a session without config.json, including a first
-        # launch that has only saved presets. Create upstream defaults only;
-        # never truncate existing preferences or enable autoload.
-        config_dir = Path(PathUtils.config_path())
-        config_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with (config_dir / "config.json").open("x") as file:
-                json.dump(INITIAL_CONFIG, file, indent=4)
-                file.write("\n")
-        except FileExistsError:
-            pass
-        proxy.set_config_dir(str(config_dir), timeout=2000)
-        if not proxy.start_injecting(group.key, name, timeout=3000):
-            raise ValueError("Input Remapper daemon rejected this preset; inspect its service log")
-    elif operation == "stop":
-        proxy.stop_injecting(group.key, timeout=2000)
-    else:
-        raise ValueError("Unknown backend operation")
-
-    # start_injecting acknowledges process startup, not injection readiness.
-    # Poll the daemon's actual per-group state and running preset, never CLI exit.
-    deadline = time.monotonic() + 4
-    while True:
-        observed = state(proxy, group)
-        if operation == "start":
-            if observed["state"] == "RUNNING" and observed["preset"] == name and not observed["suspended"]:
-                return observed
-            if observed["state"] in ("FAILED", "NO_GRAB", "UPGRADE_EVDEV"):
-                raise RuntimeError(f"Daemon reports {observed}; mapping is not running")
-        elif observed["state"] in ("UNKNOWN", "STOPPED") and not observed["preset"]:
-            return observed
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"Requested {operation}, but daemon has not confirmed it: {observed}. Refresh state or inspect Input Remapper's service log")
-        time.sleep(0.1)
+    raise ValueError("Unknown backend operation; apply and stop mappings in Input Remapper's editor")
 
 
 try:

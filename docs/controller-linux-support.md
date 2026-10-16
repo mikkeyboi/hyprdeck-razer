@@ -61,7 +61,7 @@ Protocol evidence comes from Synapse's SagePC implementation: polling get/set `0
 
 Hardware verification: the Linux plugin set 8000 Hz and read it back, then restored the original 1000 Hz. M3 → A read back as `01 12 00 10 01 20 00 00 00 00`; M1, M2 and M4–M6 were unchanged byte-for-byte, and the exact original M3 record was restored afterward. Battery read 75%, not charging. This verifies onboard configuration transactions, not physical paddle output, sustained 8-kHz cadence, persistence across a power cycle, or cold-boot wireless recovery.
 
-Additional verification: M3 → **Ctrl+Shift+F24** read back from hardware while the other five assignments remained unchanged; the original firmware-default assignment was restored. An isolated software F24-trigger preset emitted two complete F23 strokes (`down/up/down/up`) on the actual Input Remapper virtual keyboard, then injection stopped. This does not claim a physical paddle press, persistent macros in controller memory, or USB polling measurement.
+Additional verification: M3 → **Ctrl+Shift+F24** read back while the other five assignments remained unchanged; the original firmware-default assignment was restored. During backend investigation, an isolated F24-trigger macro emitted two F23 strokes (`down/up/down/up`) on the real virtual keyboard, then stopped. The shipped integration saves real presets and opens the upstream editor for explicit apply/stop; it never controls root injectors through ambiguous display-name keys. This does not claim a physical paddle press, onboard recorded macros or USB polling measurement.
 
 
 ## Cold-boot / resume wireless receiver recovery

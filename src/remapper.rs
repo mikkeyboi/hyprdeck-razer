@@ -71,6 +71,10 @@ fn device_paths(device: &usb::Device) -> Result<Vec<String>> {
         .collect())
 }
 
+fn supports_remapping(device: &usb::Device) -> bool {
+    device.is_controller() || matches!(device.inferred_kind(), "mouse" | "keyboard" | "keypad")
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
 }
@@ -90,7 +94,7 @@ pub fn group(id: &str, devices: &[&usb::Device], controller: bool) -> Group {
         if controller {
             "For paddles, first assign distinct F13–F18 keys above, then choose their keyboard events as triggers. Software presets run on Linux, not in onboard memory."
         } else {
-            "Device-scoped Input Remapper presets run on Linux, not in onboard memory. Saving a preset never activates it."
+            "Input Remapper software presets run on Linux, not in onboard memory. Save here; choose the device and apply or stop in its editor."
         },
     );
     let gui = executable("input-remapper-gtk").is_some();
@@ -111,6 +115,9 @@ pub fn group(id: &str, devices: &[&usb::Device], controller: bool) -> Group {
     }
     let mut product_paths = Vec::new();
     for device in devices {
+        if !supports_remapping(device) {
+            continue;
+        }
         match device_paths(device) {
             Ok(paths) => product_paths.push((*device, paths)),
             Err(error) => group.rows.push(Row::info(
@@ -160,40 +167,11 @@ pub fn group(id: &str, devices: &[&usb::Device], controller: bool) -> Group {
         };
         let key = text(backend, "key");
         let row_id = format!("{}:{key}", device.port);
-        let status = if let Some(error) = backend.get("service_error").and_then(Value::as_str) {
-            format!(
-                "Daemon unavailable: {error}. After package inspection, start the system input-remapper.service explicitly, or open the editor and authenticate. Hyprdeck does not start or enable it."
-            )
-        } else {
-            let state = match text(backend, "state") {
-                "RUNNING" => "Running",
-                "UNKNOWN" | "STOPPED" => "Not running",
-                other => other,
-            };
-            format!(
-                "{state} · Preset: {}{}",
-                if text(backend, "preset").is_empty() {
-                    "none"
-                } else {
-                    text(backend, "preset")
-                },
-                if backend.get("suspended").and_then(Value::as_bool) == Some(true) {
-                    " · Globally paused"
-                } else {
-                    ""
-                }
-            )
-        };
-        group.rows.push(Row::info(
-            format!("state:{row_id}"),
-            "Software macro service",
-            status,
-        ));
         if gui {
             group.rows.push(Row::info(
                 format!("editor:{row_id}"),
                 "Advanced keyboard & macro editor",
-                format!("Record combinations, edit existing presets and configure analog inputs. Choose “{key}” in the editor; opening it does not apply a mapping."),
+                format!("Record combinations, edit presets, and apply or stop mappings. Select “{key}” yourself; administrator authentication may be required. Hyprdeck does not start/stop root injectors through ambiguous device-name keys."),
             ).controlled(backend_button("editor", device, key, "Open Input Remapper editor")));
         }
         if let Some(options) = backend
@@ -224,49 +202,26 @@ pub fn group(id: &str, devices: &[&usb::Device], controller: bool) -> Group {
                 format!("No readable advertised key/button inputs: {}. Use the full editor to record analog inputs or combinations. No independent paddle events are inferred.", text(backend, "input_error")),
             ));
         }
-        if let Some(presets) = backend
+        let count = backend
             .get("presets")
             .and_then(Value::as_array)
-            .filter(|presets| !presets.is_empty())
-        {
-            let mut options = vec![json!({"value":"","label":"Choose a saved software preset"})];
-            options.extend(
-                presets
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|name| json!({"value":name,"label":name})),
-            );
-            group.rows.push(Row::info(
-                format!("presets:{row_id}"),
-                format!("Apply a saved software preset — {key}"),
-                "Applying may grab input on this physical backend group. Presets are stored per device model, but start/stop targets this connected group only. The action validates every mapping and waits for daemon RUNNING plus the selected preset; it never enables autoload or resumes other devices.",
-            ).controlled(json!({
-                "kind":"form", "label":"Apply software preset", "action":"input-remapper",
-                "args":{"operation":"start","device":device.id,"group":key},
-                "fields":[{"id":"preset","label":"Saved mapping / macro preset","kind":"choice","value":"","options":options}]
-            })));
-        } else {
-            group.rows.push(Row::info(format!("no-presets:{row_id}"), "No saved software presets", "Create a macro preset here or save one in Input Remapper, then refresh this product. Nothing is applied automatically."));
-        }
-        if !matches!(text(backend, "state"), "" | "UNKNOWN" | "STOPPED") {
-            group.rows.push(Row::info(
-            format!("stop:{row_id}"),
-            format!("Stop software mapping — {key}"),
-            "Stops this backend group's injection only, then reads daemon state until stopped/no injector. It does not clear onboard assignments, stop other products or change autoload; a separately configured autoload may apply again after reconnect.",
-        ).controlled(backend_button("stop", device, key, "Stop this software mapping")));
-        }
+            .map_or(0, Vec::len);
+        group.rows.push(Row::info(
+            format!("presets:{row_id}"),
+            format!("{count} saved software presets"),
+            "Open Input Remapper to browse, edit, apply or stop presets, including names created in its editor. Saving here never injects keys, enables autoload or changes another device's running mappings.",
+        ));
     }
     group
 }
 
 pub async fn action(args: &Value) -> Result<()> {
     let operation = string_arg(args, "operation")?;
-    if !matches!(operation, "editor" | "save" | "start" | "stop") {
+    if !matches!(operation, "editor" | "save") {
         bail!("Unknown Input Remapper action");
     }
     let device = usb::find(string_arg(args, "device")?)?;
-    if !device.is_controller() && !matches!(device.inferred_kind(), "mouse" | "keyboard" | "keypad")
-    {
+    if !supports_remapping(&device) {
         bail!("Remapping is restricted to connected mouse/keyboard/keypad/controller products");
     }
     let paths = device_paths(&device)?;
@@ -300,12 +255,8 @@ pub async fn action(args: &Value) -> Result<()> {
         return Ok(());
     }
     let values = args.get("value").unwrap_or(&Value::Null);
-    if operation == "save" {
-        for field in ["name", "input", "macro"] {
-            request[field] = Value::String(string_arg(values, field)?.to_owned());
-        }
-    } else if operation == "start" {
-        request["preset"] = Value::String(string_arg(values, "preset")?.to_owned());
+    for field in ["name", "input", "macro"] {
+        request[field] = Value::String(string_arg(values, field)?.to_owned());
     }
     backend_action(&request).await?;
     Ok(())
