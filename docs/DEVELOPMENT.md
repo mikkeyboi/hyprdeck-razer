@@ -102,7 +102,7 @@ CI runs formatting, Clippy, tests, a release build and headless protocol checks.
 - `plugin.json`
 - `hyprdeck-razer-linux-x86_64`
 - `hyprdeck-razer-linux-x86_64.sha256`
-- `70-hyprdeck-wolverine.rules` (optional administrator-installed active-seat access to the V4 PC HID configuration interface only)
+- `70-hyprdeck-wolverine.rules` (optional administrator-installed active-seat access to the V4 PC HID configuration and gamepad interfaces)
 
 Keep Cargo.toml, Cargo.lock’s root package and plugin.json versions identical; publish the compatible host first, then push the matching `vX.Y.Z` tag. Existing stable releases cannot be overwritten. Checksums verify download integrity, not trust in a publisher.
 

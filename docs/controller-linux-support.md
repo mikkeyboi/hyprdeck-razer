@@ -55,7 +55,7 @@ sudo install -m 0644 data/70-hyprdeck-wolverine.rules /etc/udev/rules.d/70-hyprd
 sudo udevadm control --reload-rules
 ```
 
-The standalone release also includes `70-hyprdeck-wolverine.rules`; use its downloaded path instead of `data/…`. Active-seat access is scoped to this model's **HID interface 1** and controller input nodes. Other keyboards/mice are not granted access and Hyprdeck does not run as root. Input-node access permits the controller's native keyboard assignments to be read and used as software macro triggers.
+The standalone release also includes `70-hyprdeck-wolverine.rules`; use its downloaded path instead of `data/…`. Active-seat access is scoped to this model's **HID interface 1** (native configuration), its **gamepad HID interface 0** and controller input nodes. Interface 0 access lets Steam Input and Proton read the gamepad as raw HID, as `steam-devices` does for supported controllers; Hyprdeck only opens interface 1. Other keyboards/mice are not granted access and Hyprdeck does not run as root. Input-node access permits the controller's native keyboard assignments to be read and used as software macro triggers.
 
 Protocol evidence comes from Synapse's SagePC implementation: polling get/set `00/c0` / `00/40` with `[profile, period]`; battery `07/80`; charging `07/84`; active profile `05/84`; button list `02/84`; single-assignment get/set `02/8c` / `02/0c`. Assignment records are `[profile, source, mode, function, size, data[5]]`; controller function 16 uses vendor target IDs (A = 32); keyboard function 2 uses `[modifiers, USB HID key]` with size 2. Applying rejects stale profiles, writes only the selected record and verifies fresh readback. No whole-profile write, mode switch or automatic reset occurs.
 
