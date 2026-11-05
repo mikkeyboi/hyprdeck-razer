@@ -1,4 +1,4 @@
-# Wolverine V4 Pro PC HID (0a79) and Wolverine V3 Pro 8K PC receiver (0a59).
+# Wolverine V4 Pro PC HID (0a79) and Wolverine V3 Pro 8K PC (0a57 wired, 0a59 receiver).
 # Keep all input interfaces bound to the kernel.
 # Active-seat access is scoped to this controller, never other keyboards/mice.
 # Interface 1 is the native configuration interface Hyprdeck opens.

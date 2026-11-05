@@ -65,9 +65,9 @@ Additional verification: M3 → **Ctrl+Shift+F24** read back while the other fiv
 
 
 
-## Native V3 Pro 8K PC receiver controls
+## Native V3 Pro 8K PC controls
 
-The Wolverine V3 Pro 8K PC over its 2.4 GHz receiver (`1532:0a59`) is also a Synapse `rzDevice25SagePC` device. Interface 1 exposes the same feature report ID 10 with 90 data bytes while `xpad` keeps interface 0. The V4 command set works unchanged; verified on one controller (firmware **1.4.0**):
+The Wolverine V3 Pro 8K PC, wired (`1532:0a57`) and over its 2.4 GHz receiver (`1532:0a59`), is also a Synapse `rzDevice25SagePC` device. Interface 1 exposes the same feature report ID 10 with 90 data bytes while `xpad` keeps interface 0. The V4 command set works unchanged; verified on one controller (firmware **1.4.0**):
 
 - Polling `00/c0`/`00/40` (default period 8 = 1000 Hz). Writing 2000 Hz read back as period 4 and `evtest` measured 1999–2000 reports/s.
 - Button list `02/84` returns M1–M6 (`0x10`–`0x15`) and Share (`0x3d`). M1–M6 defaults are controller records with target 0. Share's default record is a keyboard assignment, Alt+GUI + `0x46` (PrintScreen).
@@ -76,7 +76,7 @@ The Wolverine V3 Pro 8K PC over its 2.4 GHz receiver (`1532:0a59`) is also a Syn
 
 The 8K rejects the disabled record (function 0) with status `0x04`; its factory and Synapse "Disable" record is a controller assignment with target 0, which sends nothing. On `0a59` **Disabled** therefore writes target 0, and the separate **Firmware default** choice is not offered.
 
-The receiver answers with status `0x04` when the controller does not respond, for example after it sleeps. Hyprdeck reports this as a rejected command rather than inventing values; wake the controller and refresh. Lighting and haptics diagnostics are not shown: this model has no Chroma RGB and no rumble motors. The wired identity (`1532:0a57`) is unverified and not enabled.
+The receiver answers with status `0x04` when the controller does not respond, for example after it sleeps. Hyprdeck reports this as a rejected command rather than inventing values; wake the controller and refresh. Lighting and haptics diagnostics are not shown: this model has no Chroma RGB and no rumble motors. Wired, interface 1 declares the same report on vendor usage page `0xff00`; every command above behaves the same, and the receiver answers `0x04` while the cable is in.
 ## Cold-boot / resume wireless receiver recovery
 
 The user reports that the receiver can enumerate after reboot while the controller remains unusable until a physical replug. A missed GIP initialization exchange is a hypothesis, not an established root cause. At inspection, the V4 receiver already had `power/control=on`; disabling autosuspend alone does not explain or prove a fix for this failure.

@@ -690,7 +690,9 @@ mod tests {
             v3_8k_receiver.controller_display_name(),
             "Wolverine V3 Pro 8K PC"
         );
-        assert!(!device(0x0a57, "1-5").has_native_config());
+        let v3_8k_wired = device(0x0a57, "1-5");
+        assert!(v3_8k_wired.has_native_config());
+        assert!(v3_8k_wired.disables_with_target_zero());
         assert!(!device(0x0a3f, "1-4").has_native_config());
         assert_eq!(device(0x025a, "1-2").inferred_kind(), "keyboard");
         assert_eq!(device(0x0244, "1-3").inferred_kind(), "keypad");

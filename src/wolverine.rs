@@ -1,5 +1,6 @@
 //! Native configuration for Wolverine V4 Pro PC HID (1532:0a79) and Wolverine
-//! V3 Pro 8K PC via its 2.4 GHz receiver (1532:0a59), without detaching the
+//! V3 Pro 8K PC wired (1532:0a57) and via its 2.4 GHz receiver (1532:0a59),
+//! without detaching the
 //! input driver. Both are Synapse SagePC devices with the same interface 1
 //! protocol; V4-only diagnostics (lighting, haptics, support links) stay V4-only.
 //!
@@ -67,7 +68,7 @@ impl Session {
     fn open(device: &usb::Device) -> Result<Self> {
         ensure!(
             device.has_native_config(),
-            "Native controls require Wolverine V4 Pro PC HID mode (Function + Menu + Y; 1532:0a79) or the Wolverine V3 Pro 8K PC receiver (1532:0a59)"
+            "Native controls require Wolverine V4 Pro PC HID mode (Function + Menu + Y; 1532:0a79) or the Wolverine V3 Pro 8K PC (1532:0a57 wired, 1532:0a59 receiver)"
         );
         let root = Path::new("/sys/class/hidraw");
         for entry in fs::read_dir(root).context("Reading HID raw interfaces")? {

@@ -103,16 +103,16 @@ impl Device {
 
     /// Identities whose interface 1 speaks Synapse's SagePC 90-byte protocol
     /// (feature report 10): Wolverine V4 Pro PC HID and Wolverine V3 Pro 8K PC
-    /// over its 2.4 GHz receiver.
+    /// wired and over its 2.4 GHz receiver.
     pub fn has_native_config(&self) -> bool {
-        matches!(self.product_id, 0x0a59 | 0x0a79)
+        matches!(self.product_id, 0x0a57 | 0x0a59 | 0x0a79)
     }
 
     /// The V3 Pro 8K PC rejects the disabled assignment record (function 0)
     /// with status 0x04. Its factory and Synapse "Disable" record is a
     /// controller assignment with target 0, which sends nothing.
     pub fn disables_with_target_zero(&self) -> bool {
-        self.product_id == 0x0a59
+        matches!(self.product_id, 0x0a57 | 0x0a59)
     }
 
     pub fn has_rear_buttons(&self) -> bool {
@@ -342,7 +342,7 @@ impl Device {
             group.rows.push(Row::info("controller-limits", "Physical polling limits", match self.product_id {
                 0x0a3f => "Original Wolverine V3 Pro: vendor documents up to 250 Hz wireless and 1000 Hz wired PC Tournament Mode (Function + Menu + A). A 4 ms wireless USB endpoint does not become 1000 Hz via a Linux interval override. The 8K PC model is different hardware.",
                 0x0a76 | 0x0a78 | 0x0a79 => "Wolverine V4 Pro (RZ06-0606): Xbox (1532:0a76), PC XInput (1532:0a78) and PC HID (1532:0a79) are distinct USB personalities. Advertised PC support is up to 8000 Hz; only a successful native getter reports the current onboard polling setting, not endpoint scheduling or USB speed.",
-                _ => "1532:0a57 wired and 0a59 wireless are Wolverine V3 Pro 8K PC identities documented in OpenRazer issue #2569 and upstream xpad support. Advertised PC support is up to 8000 Hz; on the 0a59 receiver only a successful native getter reports the current onboard polling setting, not endpoint scheduling or UI sampling.",
+                _ => "1532:0a57 wired and 0a59 wireless are Wolverine V3 Pro 8K PC identities documented in OpenRazer issue #2569 and upstream xpad support. Advertised PC support is up to 8000 Hz; only a successful native getter reports the current onboard polling setting, not endpoint scheduling or UI sampling.",
             }));
         }
         if self.product_id == 0x0a3f {
