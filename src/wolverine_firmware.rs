@@ -50,20 +50,22 @@ pub fn groups(device: &usb::Device, session: &mut Session) -> Result<[Group; 2]>
         "Extended firmware reply · 00/87",
         format!("{raw}. Additional bytes are retained without assigning unverified component identities or versions."),
     ));
-    details.rows.push(Row::info(
-        "update-support",
-        "No verified V4 native update image or transport",
-        "The retained V4 Synapse model has no latestFirmwareInfo/update image. No native flashing or V3 updater is offered. An official image and documented V4 transport, or an exact supported fwupd/LVFS device and release, are prerequisites for Linux updating.",
-    ));
-    group.rows.push(Row::info(
-        "official-downloads",
-        "V4 support downloads: pairing utility, not firmware",
-        "Razer support article 21268 (RZ06-06060), inspected 16 October 2026, lists Pairing Utility v1.00.00_r2 dated 6 October 2026, but no firmware updater. A pairing utility version is not an available firmware version. Recheck official support for future releases; no image is downloaded or executed here.",
-    ));
-    group.rows.push(Row::info(
-        "official-support",
-        "Official V4 support and safe update path",
-        format!("Model support: {SUPPORT_PAGE}. Product information: {PRODUCT_PAGE}. Use only an updater explicitly supplied for Wolverine V4 Pro by Razer, following its Windows/controller/dongle and power instructions; do not run a V3 updater or assume Wine/VM USB flashing is safe."),
-    ).controlled(json!({"kind":"button","label":"Open official V4 support","action":"vendor-page","args":{"device":device.id},"destructive":false})));
+    if device.is_wolverine_v4() {
+        details.rows.push(Row::info(
+            "update-support",
+            "No verified V4 native update image or transport",
+            "The retained V4 Synapse model has no latestFirmwareInfo/update image. No native flashing or V3 updater is offered. An official image and documented V4 transport, or an exact supported fwupd/LVFS device and release, are prerequisites for Linux updating.",
+        ));
+        group.rows.push(Row::info(
+            "official-downloads",
+            "V4 support downloads: pairing utility, not firmware",
+            "Razer support article 21268 (RZ06-06060), inspected 16 October 2026, lists Pairing Utility v1.00.00_r2 dated 6 October 2026, but no firmware updater. A pairing utility version is not an available firmware version. Recheck official support for future releases; no image is downloaded or executed here.",
+        ));
+        group.rows.push(Row::info(
+            "official-support",
+            "Official V4 support and safe update path",
+            format!("Model support: {SUPPORT_PAGE}. Product information: {PRODUCT_PAGE}. Use only an updater explicitly supplied for Wolverine V4 Pro by Razer, following its Windows/controller/dongle and power instructions; do not run a V3 updater or assume Wine/VM USB flashing is safe."),
+        ).controlled(json!({"kind":"button","label":"Open official V4 support","action":"vendor-page","args":{"device":device.id},"destructive":false})));
+    }
     Ok([group, details])
 }
