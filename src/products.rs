@@ -684,6 +684,8 @@ mod tests {
         let v3_8k_receiver = device(0x0a59, "1-5");
         assert!(v3_8k_receiver.has_native_config());
         assert!(!v3_8k_receiver.is_wolverine_v4());
+        assert!(v3_8k_receiver.disables_with_target_zero());
+        assert!(!v4_hid.disables_with_target_zero());
         assert_eq!(
             v3_8k_receiver.controller_display_name(),
             "Wolverine V3 Pro 8K PC"

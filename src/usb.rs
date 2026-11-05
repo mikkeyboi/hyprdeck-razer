@@ -108,6 +108,13 @@ impl Device {
         matches!(self.product_id, 0x0a59 | 0x0a79)
     }
 
+    /// The V3 Pro 8K PC rejects the disabled assignment record (function 0)
+    /// with status 0x04. Its factory and Synapse "Disable" record is a
+    /// controller assignment with target 0, which sends nothing.
+    pub fn disables_with_target_zero(&self) -> bool {
+        self.product_id == 0x0a59
+    }
+
     pub fn has_rear_buttons(&self) -> bool {
         matches!(self.product_id, 0x0a3f | 0x0a57 | 0x0a59 | 0x0a76..=0x0a79)
             || self.name.contains("Wolverine")

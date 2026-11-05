@@ -424,7 +424,7 @@ pub fn action(args: &Value) -> Result<Group> {
             &mut session,
             args.get("value").context("Missing polling form value")?,
         )?,
-        "mapping" => mapping::action(&mut session, args)?,
+        "mapping" => mapping::action(&device, &mut session, args)?,
         "keyboard" => mapping::keyboard_action(&mut session, args)?,
         _ => unreachable!(),
     }

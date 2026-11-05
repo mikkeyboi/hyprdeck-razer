@@ -74,6 +74,8 @@ The Wolverine V3 Pro 8K PC over its 2.4 GHz receiver (`1532:0a59`) is also a Syn
 - Keyboard assignments `02/0c` (function 2) emit on the receiver's interface 1 keyboard device; M3 → F13 was verified with `evtest`. Paddle layout: M3 left top, M4 right top, M5 left bottom, M6 right bottom.
 - Battery `07/80`, active profile `05/84` and firmware `00/87` read normally.
 
+The 8K rejects the disabled record (function 0) with status `0x04`; its factory and Synapse "Disable" record is a controller assignment with target 0, which sends nothing. On `0a59` **Disabled** therefore writes target 0, and the separate **Firmware default** choice is not offered.
+
 The receiver answers with status `0x04` when the controller does not respond, for example after it sleeps. Hyprdeck reports this as a rejected command rather than inventing values; wake the controller and refresh. Lighting and haptics diagnostics are not shown: this model has no Chroma RGB and no rumble motors. The wired identity (`1532:0a57`) is unverified and not enabled.
 ## Cold-boot / resume wireless receiver recovery
 

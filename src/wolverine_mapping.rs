@@ -20,7 +20,7 @@
 
 use super::{Session, keyboard};
 use crate::{Group, Row, usb};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 const NORMAL_MODE: u8 = 0;
@@ -125,13 +125,18 @@ impl Assignment {
             && self.data[..usize::from(self.size)] == other.data[..usize::from(other.size)]
     }
 
-    fn description(self) -> String {
+    fn description(self, target_zero_disables: bool) -> String {
         if self.function == 0 && self.size == 0 {
             return "Disabled".into();
         }
         if self.function == CONTROLLER_FUNCTION && self.size == 1 {
             if self.data[0] == 0 {
-                return "Firmware default".into();
+                return if target_zero_disables {
+                    "Disabled"
+                } else {
+                    "Firmware default"
+                }
+                .into();
             }
             if let Some((_, label, _)) = TARGETS.iter().find(|(_, _, id)| *id == self.data[0]) {
                 return (*label).into();
@@ -230,7 +235,7 @@ pub fn groups(device: &usb::Device, session: &mut Session) -> Result<[Group; 2]>
         }
         let current = read_assignment(session, profile, *button)
             .with_context(|| format!("Reading {name} onboard assignment"))?;
-        let description = current.description();
+        let description = current.description(device.disables_with_target_zero());
         if !summary.is_empty() {
             summary.push_str(" · ");
         }
@@ -250,11 +255,11 @@ pub fn groups(device: &usb::Device, session: &mut Session) -> Result<[Group; 2]>
             .map(|((field, _, _), _)| *field)
             .context("No assignable buttons")?
     };
-    let mut targets = vec![
-        json!({"value":"keep","label":"Keep current"}),
-        json!({"value":"default","label":"Firmware default"}),
-        json!({"value":"disabled","label":"Disabled"}),
-    ];
+    let mut targets = vec![json!({"value":"keep","label":"Keep current"})];
+    if !device.disables_with_target_zero() {
+        targets.push(json!({"value":"default","label":"Firmware default"}));
+    }
+    targets.push(json!({"value":"disabled","label":"Disabled"}));
     targets.extend(
         TARGETS
             .iter()
@@ -326,11 +331,16 @@ fn save(session: &mut Session, profile: u8, index: usize, target: Target) -> Res
     ensure_active_profile(session, profile)
 }
 
-pub fn action(session: &mut Session, args: &Value) -> Result<()> {
+pub fn action(device: &usb::Device, session: &mut Session, args: &Value) -> Result<()> {
     let (profile, index, value) = selected(args)?;
+    let target_zero_disables = device.disables_with_target_zero();
     let target = match crate::string_arg(value, "target")? {
         "keep" => return ensure_active_profile(session, profile),
+        "default" if target_zero_disables => {
+            bail!("This controller has no separate firmware default; choose Disabled")
+        }
         "default" => Target::Controller(0),
+        "disabled" if target_zero_disables => Target::Controller(0),
         "disabled" => Target::Disabled,
         target => Target::Controller(
             TARGETS
