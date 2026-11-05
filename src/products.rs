@@ -352,7 +352,7 @@ pub fn assemble(
                     .insert(0, tools.id.clone());
                 groups.push(tools);
                 battery = kernel_battery(device);
-                if device.product_id == 0x0a79 {
+                if device.has_native_config() {
                     match crate::wolverine::snapshot(device) {
                         Ok(snapshot) => {
                             for (section, group) in snapshot.groups {
@@ -466,7 +466,7 @@ pub fn assemble(
                 "Only actual device battery APIs are used",
             )
             .collapsed();
-            status.rows.push(Row::info("source", "No percentage source available", if primary.product_id == 0x0a79 { "Neither the native PC HID battery getter nor a matching kernel power_supply provided a real percentage. See Power for native read status; no percentage is inferred from the USB connection." } else if controller { "No battery power_supply with a real capacity attribute belongs to this physical USB device. xpad input and receiver presence do not provide battery percentage. A compatible verified GIP battery driver is required." } else { "OpenRazer getBattery is unavailable or returned its unknown sentinel; receiver/dock presence and USB descriptor revision are not battery readings." }));
+            status.rows.push(Row::info("source", "No percentage source available", if primary.has_native_config() { "Neither the native PC HID battery getter nor a matching kernel power_supply provided a real percentage. See Power for native read status; no percentage is inferred from the USB connection." } else if controller { "No battery power_supply with a real capacity attribute belongs to this physical USB device. xpad input and receiver presence do not provide battery percentage. A compatible verified GIP battery driver is required." } else { "OpenRazer getBattery is unavailable or returned its unknown sentinel; receiver/dock presence and USB descriptor revision are not battery readings." }));
             diagnostics.push(status.id.clone());
             groups.push(status);
         }
@@ -678,6 +678,22 @@ mod tests {
             v4_hid.controller_display_name(),
             "Wolverine V4 Pro (PC HID)"
         );
+        assert!(v4_hid.has_native_config());
+        assert!(!v4.has_native_config());
+        assert!(!v4_pc.has_native_config());
+        let v3_8k_receiver = device(0x0a59, "1-5");
+        assert!(v3_8k_receiver.has_native_config());
+        assert!(!v3_8k_receiver.is_wolverine_v4());
+        assert!(v3_8k_receiver.disables_with_target_zero());
+        assert!(!v4_hid.disables_with_target_zero());
+        assert_eq!(
+            v3_8k_receiver.controller_display_name(),
+            "Wolverine V3 Pro 8K PC"
+        );
+        let v3_8k_wired = device(0x0a57, "1-5");
+        assert!(v3_8k_wired.has_native_config());
+        assert!(v3_8k_wired.disables_with_target_zero());
+        assert!(!device(0x0a3f, "1-4").has_native_config());
         assert_eq!(device(0x025a, "1-2").inferred_kind(), "keyboard");
         assert_eq!(device(0x0244, "1-3").inferred_kind(), "keypad");
         assert_eq!(device(0x0527, "1-4").inferred_kind(), "headset");

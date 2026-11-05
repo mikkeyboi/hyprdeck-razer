@@ -1,4 +1,8 @@
-//! Wolverine V4 Pro PC HID (1532:0a79), without detaching the input driver.
+//! Native configuration for Wolverine V4 Pro PC HID (1532:0a79) and Wolverine
+//! V3 Pro 8K PC wired (1532:0a57) and via its 2.4 GHz receiver (1532:0a59),
+//! without detaching the
+//! input driver. Both are Synapse SagePC devices with the same interface 1
+//! protocol; V4-only diagnostics (lighting, haptics, support links) stay V4-only.
 //!
 //! Synapse `ui-main.js` module 54849 builds 90-byte Razer packets with a 1..31
 //! transaction ID and XOR of packet bytes 2..88. The observed interface 1 HID
@@ -63,8 +67,8 @@ pub struct Session {
 impl Session {
     fn open(device: &usb::Device) -> Result<Self> {
         ensure!(
-            device.product_id == 0x0a79,
-            "Native controls require Wolverine V4 Pro PC HID mode (Function + Menu + Y; 1532:0a79)"
+            device.has_native_config(),
+            "Native controls require Wolverine V4 Pro PC HID mode (Function + Menu + Y; 1532:0a79) or the Wolverine V3 Pro 8K PC (1532:0a57 wired, 1532:0a59 receiver)"
         );
         let root = Path::new("/sys/class/hidraw");
         for entry in fs::read_dir(root).context("Reading HID raw interfaces")? {
@@ -95,7 +99,9 @@ impl Session {
                 return Err(std::io::Error::last_os_error()).context("Reading HID identity");
             }
             ensure!(
-                info.bustype == 3 && info.vendor == 0x1532 && info.product == 0x0a79,
+                info.bustype == 3
+                    && info.vendor as u16 == 0x1532
+                    && info.product as u16 == device.product_id,
                 "HID identity changed while opening the controller; refresh devices"
             );
             let deadline = Instant::now() + COMMAND_TIMEOUT;
@@ -393,13 +399,16 @@ pub fn snapshot(device: &usb::Device) -> Result<Snapshot> {
             failed_group(device, "firmware", "Installed firmware unavailable", error),
         )),
     }
-    groups.push(("tools", lighting::group(device)));
-    match motor::group(device, &mut session) {
-        Ok(group) => groups.push(("diagnostics", group.collapsed())),
-        Err(error) => groups.push((
-            "diagnostics",
-            failed_group(device, "motor", "Native haptic details unavailable", error).collapsed(),
-        )),
+    if device.is_wolverine_v4() {
+        groups.push(("tools", lighting::group(device)));
+        match motor::group(device, &mut session) {
+            Ok(group) => groups.push(("diagnostics", group.collapsed())),
+            Err(error) => groups.push((
+                "diagnostics",
+                failed_group(device, "motor", "Native haptic details unavailable", error)
+                    .collapsed(),
+            )),
+        }
     }
     Ok(Snapshot { groups, battery })
 }
@@ -416,7 +425,7 @@ pub fn action(args: &Value) -> Result<Group> {
             &mut session,
             args.get("value").context("Missing polling form value")?,
         )?,
-        "mapping" => mapping::action(&mut session, args)?,
+        "mapping" => mapping::action(&device, &mut session, args)?,
         "keyboard" => mapping::keyboard_action(&mut session, args)?,
         _ => unreachable!(),
     }
